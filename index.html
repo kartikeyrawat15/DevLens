@@ -1670,6 +1670,45 @@ const AuthMapper = (()=>{
     return parts.join(' ');
   }
 
+  // Express-style: collect the names passed as MIDDLE arguments (middleware) of a route
+  // call — i.e. app.get('/path', mwA, mwB, handler). The path is already stripped (it is
+  // in `rest`); we keep every bare-identifier arg that is FOLLOWED by a comma, which
+  // excludes the final handler argument and inline (req,res)=>{} handlers.
+  function middlewareArgNames(rest){
+    const names=[];
+    let s=(rest||'').trim();
+    // array form: app.get('/p', [mwA, mwB], handler)
+    const arr=/^\[([^\]]*)\]/.exec(s);
+    if(arr){
+      arr[1].split(',').forEach(t=>{t=t.trim();if(/^[A-Za-z_$][\w$.]*$/.test(t))names.push(t);});
+      s=s.slice(arr[0].length).replace(/^\s*,\s*/,'');
+    }
+    // peel leading `identifier ,` arguments (each has something after it → not the handler)
+    let mm;const lead=/^([A-Za-z_$][\w$.]*)\s*,/;
+    while((mm=lead.exec(s))){names.push(mm[1]);s=s.slice(mm[0].length).trim();}
+    return names;
+  }
+
+  // Does a function body behave like auth middleware? (per the custom-middleware heuristic)
+  function authBodyHeuristic(body){
+    if(!body)return false;
+    return /\breq\.(session|user|isAuthenticated)\b/.test(body)          // reads req.session / req.user / req.isAuthenticated
+      || /\brequest\.(session|user)\b/.test(body)
+      || /\.redirect\s*\(\s*[`'"][^`'"]*\/login/i.test(body)             // redirects to /login
+      || /token|jwt|bearer|authorization|password|passwd|bcrypt/i.test(body);  // checks a token or password
+  }
+
+  // Look up the route's middleware names in the symbol table; treat as auth if any of
+  // those functions perform an auth check (custom-named Express middleware).
+  function hasCustomAuthMiddleware(rest){
+    const byName=State.symByName||{};
+    for(const n of middlewareArgNames(rest)){
+      const cands=byName[n]||byName[n.split('.').pop()]||[];
+      for(const sym of cands)if(authBodyHeuristic(sym.body))return true;
+    }
+    return false;
+  }
+
   function run(files){
     const routes=[];
     for(const f of files){
@@ -1679,8 +1718,8 @@ const AuthMapper = (()=>{
         const line=lines[i];
         if(/^\s*(\/\/|#|\*)/.test(line))continue;
         let method,path,rest='';
-        let m;let isNext=false;let isPy=false;
-        if((m=ROUTE_RE.exec(line))){method=m[1].toUpperCase();path=m[3];rest=m[4]||'';}
+        let m;let isNext=false;let isPy=false;let isExpress=false;
+        if((m=ROUTE_RE.exec(line))){method=m[1].toUpperCase();path=m[3];rest=m[4]||'';isExpress=true;}
         else if(FASTIFY_ROUTE.test(line)){
           // gather the object literal across up to 8 lines
           const block=lines.slice(i,i+8).join(' ');
@@ -1720,7 +1759,8 @@ const AuthMapper = (()=>{
         const ctxBlock=isNext?f.content
           :isPy?rest
           :(line+' '+lines.slice(i+1,i+5).join(' '));
-        const hasAuth=AUTH_MW.test(line)||AUTH_MW.test(rest)||AUTH_MW.test(ctxBlock);
+        const hasAuth=AUTH_MW.test(line)||AUTH_MW.test(rest)||AUTH_MW.test(ctxBlock)
+          ||(isExpress&&hasCustomAuthMiddleware(rest));   // custom-named middleware resolved via symbol table
         const hasRole=ROLE_MW.test(line)||ROLE_MW.test(rest)||ROLE_MW.test(ctxBlock);
         const hasIdParam=/[:{]\s*(id|userId|uid|user_id|\w*Id)\b|<\w*id\w*>/i.test(path);
         const ownershipCheck=/ownerId|userId\s*===|req\.user\.id|belongsTo|\.owner|checkOwnership|isOwner|session\.user|currentUser\.id|user\.id\s*==|filter_by\(\s*user|owner\s*==\s*request\.user/i.test(ctxBlock);
