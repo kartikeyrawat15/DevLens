@@ -314,8 +314,18 @@ code,pre,.mono{font-family:var(--mono)}
 .tier-ind{padding:9px 11px;border-radius:8px;font-size:12.5px;font-weight:600;margin:2px 0 16px;border:1px solid var(--border);color:var(--fg2)}
 .tier-ind.t2{color:var(--yellow);border-color:var(--yellow)}
 .tier-ind.t3{color:var(--accent);border-color:var(--accent);background:var(--bg3)}
-.dead-counts{display:flex;gap:10px;align-items:center;font-size:13px;font-weight:600;margin-bottom:6px}
-.dead-counts .dc-hi{color:var(--fg)} .dead-counts .dc-lo{color:var(--yellow)} .dead-counts .dc-sep{color:var(--fg3)}
+.dead-sec{font-size:14px;font-weight:700;margin:18px 0 10px;display:flex;align-items:baseline;gap:8px}
+.dead-sec:first-of-type{margin-top:4px}
+.dead-sec .dead-sub{font-size:11px;font-weight:400;color:var(--fg3)}
+.dead-t3{color:var(--red)} .dead-t2{color:var(--yellow)}
+.dead-excluded{margin-top:18px;border:1px solid var(--border);border-radius:8px;padding:8px 12px;background:var(--bg2)}
+.dead-excluded>summary{cursor:pointer;font-size:12.5px;color:var(--fg2);font-weight:600}
+.excluded-list{margin-top:8px;display:flex;flex-direction:column;gap:3px}
+.excluded-row{display:flex;gap:8px;align-items:baseline;font-size:11.5px;padding:2px 0;cursor:pointer;border-bottom:1px solid var(--border)}
+.excluded-row:hover{background:var(--bg3)}
+.excluded-row .ex-name{color:var(--accent);min-width:160px}
+.excluded-row .ex-loc{color:var(--fg3);font-family:var(--mono);min-width:120px}
+.excluded-row .ex-why{color:var(--fg3)}
 
 /* ---------- Banners / toast ---------- */
 #banner{display:none;padding:9px 16px;background:var(--yellow-bg);color:var(--yellow);
@@ -682,7 +692,8 @@ const State = {
   importGraph: {},      // file -> [imported files]
   importedBy: {},       // file -> [files that import it]
   exportMap: {},        // file -> [export names]
-  deadCode: [],         // {kind, name, file, line, reason}
+  deadCode: [],         // actionable dead code: Tier 3 (dead) + Tier 2 (verify)
+  deadExcluded: [],     // Tier 1: runtime-invoked / framework hooks / overrides (informational)
   taintFlows: [],       // {source, sink, sourceLine, sinkLine, file, var, severity}
   routes: [],           // {method, path, file, line, hasAuth, hasRole, isPublic, idor}
   findings: [],         // unified, correlated
@@ -1420,10 +1431,15 @@ const ASTEngine = (()=>{
     }
     for(const k in reverseCall)reverseCall[k]=[...new Set(reverseCall[k])];
 
-    // DEAD CODE
-    const deadCode=[];
+    // ════════ DEAD CODE — universal confidence tiers ════════
+    //  T1 excluded (runtime-invoked / framework hooks / overrides — never flagged)
+    //  T2 verify   (exported / string-dispatch / library API / documented — possibly dead)
+    //  T3 dead     (defined, never referenced, no framework signal — high confidence)
+    const deadCode=[];      // actionable: Tier 3 (dead) + Tier 2 (verify)
+    const deadExcluded=[];  // Tier 1: runtime-invoked / framework hooks / overrides (informational)
+
+    // named imports across files (JS)
     const importedNames=new Set();
-    // collect named imports across files
     for(const f of files){
       const txt=f.content;let im;
       const re=/import\s+\{([^}]*)\}/g;
@@ -1431,108 +1447,151 @@ const ASTEngine = (()=>{
       const re2=/const\s+\{([^}]*)\}\s*=\s*require/g;
       while((im=re2.exec(txt)))im[1].split(',').forEach(n=>importedNames.add(n.trim()));
     }
-    // bare-reference frequency across the corpus (catches middleware/callbacks passed by
-    // name). String- and comment-aware: a name that appears ONLY inside a string (e.g. an
-    // __all__ entry or a getattr('name') target) or a comment is NOT a real code reference,
-    // so it still counts as unreferenced — those cases are surfaced as LOW-confidence below.
-    const stripStrCom=(src,isPy)=>{
-      let s=src;
-      if(isPy)s=s.replace(/'''[\s\S]*?'''/g,'').replace(/"""[\s\S]*?"""/g,'');
-      s=s.replace(/'(?:\\.|[^'\\])*'/g,'').replace(/"(?:\\.|[^"\\])*"/g,'');
-      return isPy?s.replace(/#.*$/gm,''):s.replace(/\/\/.*$/gm,'').replace(/\/\*[\s\S]*?\*\//g,'');
+    // partition each file into code / strings / comments. A name appearing ONLY in a string
+    // or comment is NOT a real code reference (it surfaces as Tier 2 "verify" instead).
+    // Template literals (backticks) are intentionally NOT stripped — interpolated callbacks
+    // like onclick="${fn}" must still count as a reference (we err toward "used").
+    const splitParts=(src,isPy)=>{
+      const strings=[],comments=[];let code=src;
+      if(isPy)code=code.replace(/'''[\s\S]*?'''|"""[\s\S]*?"""/g,m=>{strings.push(m);return ' ';});
+      code=code.replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"/g,m=>{strings.push(m);return ' ';});
+      if(isPy)code=code.replace(/#.*$/gm,m=>{comments.push(m);return ' ';});
+      else code=code.replace(/\/\/.*$/gm,m=>{comments.push(m);return ' ';}).replace(/\/\*[\s\S]*?\*\//g,m=>{comments.push(m);return ' ';});
+      return {code,strings:strings.join(' '),comments:comments.join(' ')};
     };
     const refCount=Object.create(null);
+    const stringTokens=new Set();   // identifiers appearing inside string literals
+    const commentTokens=new Set();  // identifiers appearing inside comments
     for(const f of files){
       if(!ANALYZABLE.has(f.ext))continue;
-      let tm;const tok=/[A-Za-z_$][\w$]*/g;const code=stripStrCom(f.content,f.ext==='py');
-      while((tm=tok.exec(code)))refCount[tm[0]]=(refCount[tm[0]]||0)+1;
+      const {code,strings,comments}=splitParts(f.content,f.ext==='py');
+      const add=(txt,set)=>{let m;const re=/[A-Za-z_$][\w$]*/g;while((m=re.exec(txt)))set?set.add(m[0]):(refCount[m[0]]=(refCount[m[0]]||0)+1);};
+      add(code,null);add(strings,stringTokens);add(comments,commentTokens);
     }
-    /* ── Dead-code confidence signals (any present → LOW "verify", none → HIGH "real") ── */
-    const PY_FRAMEWORK_HOOKS=new Set(['make_shell_context','create_url_adapter',
-      'create_jinja_environment','iter_blueprints','create_global_jinja_loader',
-      'open_resource','make_null_session']);
-    const HOOK_AFFIX=/(_handler|_context|_loader|_processor|_receiver|_command|_task|_view)$|^(handler|context|loader|processor|receiver|command|task|view)_/i;
-    const TEST_FIXTURE=/^(setUp|tearDown|setUpClass|tearDownClass|setUpModule|tearDownModule)$|^fixture_/;
-    // names declared in any __all__ anywhere in the codebase → public API surface
+    // __all__ public API surface (Python)
     const allExports=new Set();
-    for(const f of files){
-      let am;const are=/__all__\s*=\s*[\[(]([^\])]*)[\])]/g;
-      while((am=are.exec(f.content)))am[1].split(',').forEach(n=>{n=n.replace(/['"\s]/g,'');if(n)allExports.add(n);});
-    }
-    // names applied as a decorator (@name / @obj.name) anywhere → the decorator fn is genuinely used
+    for(const f of files){let am;const are=/__all__\s*=\s*[\[(]([^\])]*)[\])]/g;
+      while((am=are.exec(f.content)))am[1].split(',').forEach(n=>{n=n.replace(/['"\s]/g,'');if(n)allExports.add(n);});}
+    // names applied as a decorator anywhere → that function is genuinely used
     const decoratorNames=new Set();
+    for(const f of files){if(!ANALYZABLE.has(f.ext))continue;let dm;const dre=/^\s*@\s*([A-Za-z_$][\w$.]*)/gm;
+      while((dm=dre.exec(f.content))){const full=dm[1];decoratorNames.add(full.split('.').pop());if(!full.includes('.'))decoratorNames.add(full);}}
+    // names registered as a runtime callback (addEventListener/setTimeout/.on/.use/target=/go) + JS exports
+    const registeredNames=new Set(),defaultExportNames=new Set(),moduleExportNames=new Set();
+    const REG_RES=[
+      /addEventListener\s*\(\s*[^,]+,\s*([A-Za-z_$][\w$]*)/g,
+      /\bset(?:Timeout|Interval)\s*\(\s*([A-Za-z_$][\w$]*)\s*,/g,
+      /\.(?:on|once|addListener|connect|subscribe|register|use)\s*\(\s*(?:[^,()]*,\s*)?([A-Za-z_$][\w$]*)\s*[,)]/g,
+      /\btarget\s*=\s*([A-Za-z_$][\w$]*)/g,
+      /\bgo\s+([A-Za-z_$][\w$]*)\s*\(/g,
+    ];
+    const DEF_EXPORT_FN=/export\s+default\s+(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/g;
+    const DEF_EXPORT_ID=/export\s+default\s+([A-Za-z_$][\w$]*)\s*;?/g;
+    const MOD_EXPORT_OBJ=/module\.exports\s*=\s*\{([^}]*)\}/g;
+    const MOD_EXPORT_PROP=/(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=/g;
+    const MOD_EXPORT_ID=/module\.exports\s*=\s*([A-Za-z_$][\w$]*)\s*;?/g;
     for(const f of files){
-      if(!ANALYZABLE.has(f.ext))continue;
-      let dm;const dre=/^\s*@\s*([A-Za-z_$][\w$.]*)/gm;
-      while((dm=dre.exec(f.content))){const full=dm[1];
-        decoratorNames.add(full.split('.').pop());if(!full.includes('.'))decoratorNames.add(full);}
+      if(!ANALYZABLE.has(f.ext))continue;const txt=f.content;let m;
+      for(const re of REG_RES){re.lastIndex=0;while((m=re.exec(txt)))registeredNames.add(m[1]);}
+      DEF_EXPORT_FN.lastIndex=0;while((m=DEF_EXPORT_FN.exec(txt)))defaultExportNames.add(m[1]);
+      DEF_EXPORT_ID.lastIndex=0;while((m=DEF_EXPORT_ID.exec(txt)))defaultExportNames.add(m[1]);
+      MOD_EXPORT_ID.lastIndex=0;while((m=MOD_EXPORT_ID.exec(txt)))defaultExportNames.add(m[1]);
+      MOD_EXPORT_OBJ.lastIndex=0;while((m=MOD_EXPORT_OBJ.exec(txt)))m[1].split(',').forEach(x=>{const n=x.split(':')[0].trim();if(/^[A-Za-z_$][\w$]*$/.test(n))moduleExportNames.add(n);});
+      MOD_EXPORT_PROP.lastIndex=0;while((m=MOD_EXPORT_PROP.exec(txt)))moduleExportNames.add(m[1]);
     }
-    // names referenced via dynamic dispatch as a string: getattr(_, 'name') / globals()['name'] / locals()['name']
-    const dynamicRefNames=new Set();
-    for(const f of files){
-      if(!ANALYZABLE.has(f.ext))continue;let gm;
-      const gre=/getattr\s*\(\s*[^,()]+,\s*['"]([A-Za-z_$][\w$]*)['"]|(?:globals|locals)\s*\(\s*\)\s*\[\s*['"]([A-Za-z_$][\w$]*)['"]/g;
-      while((gm=gre.exec(f.content)))dynamicRefNames.add(gm[1]||gm[2]);
-    }
-    // returns the list of LOW-confidence reasons for an unused symbol (empty → HIGH confidence)
-    function lowConfidenceReasons(s,isPyFile){
-      const n=s.name,r=[];
-      if(s.decorated)r.push('decorated');
-      if((isPyFile&&s.exported)||allExports.has(n))r.push('listed in __all__');
-      if(isPyFile&&PY_FRAMEWORK_HOOKS.has(n))r.push('framework hook name');
-      if(HOOK_AFFIX.test(n))r.push('hook naming convention');
-      if(/^__\w+__$/.test(n))r.push('magic method');
-      if(TEST_FIXTURE.test(n))r.push('test fixture');
-      if(dynamicRefNames.has(n))r.push('dynamic dispatch reference');
-      return r;
-    }
+    // name-pattern hook tables
+    const DUNDER=/^__\w+__$/;
+    const PY_HOOK_SUFFIX=/(_view|_handler|_task|_command|_signal|_receiver|_processor|_hook|_context|_loader|_filter|_tag|_middleware)$/;
+    const JS_LIFECYCLE=new Set(['componentDidMount','componentWillMount','componentWillUnmount','componentDidUpdate','componentWillReceiveProps','shouldComponentUpdate','getDerivedStateFromProps','getSnapshotBeforeUpdate','componentDidCatch','getServerSideProps','getStaticProps','getStaticPaths','getInitialProps','loader','action','render','ngOnInit','ngOnDestroy','ngAfterViewInit']);
+    const TEST_HOOKS=new Set(['beforeAll','afterAll','beforeEach','afterEach','before','after','describe','it','test','xit','xdescribe','fit','fdescribe','setUp','tearDown','setUpClass','tearDownClass','setUpModule','tearDownModule']);
+    const ANDROID_LIFECYCLE=new Set(['onCreate','onStart','onResume','onPause','onStop','onDestroy','onCreateView','onViewCreated','onActivityResult','onRequestPermissionsResult','onReceive','onBind','onStartCommand','onDestroyView','onAttach','onDetach','onSaveInstanceState','onRestoreInstanceState','onCreateOptionsMenu','onOptionsItemSelected']);
+    const DJANGO_METHODS=new Set(['save','delete','clean','clean_fields','full_clean','get_absolute_url','get_queryset','get_context_data','perform_create','perform_update','perform_destroy','get_serializer_class','get_serializer','form_valid','form_invalid','dispatch','has_permission','has_object_permission']);
+    const fileLines=Object.create(null);for(const f of files)fileLines[f.path]=f.content.split('\n');
+    const annotatedOrOverride=s=>{
+      const L=fileLines[s.file]||[];
+      if(/\b(override|open\s+override)\b/.test(L[s.line-1]||''))return true;     // Kotlin/Swift
+      let k=s.line-2;while(k>=0&&!(L[k]||'').trim())k--;
+      return /^\s*@(Override|Composable|Test|Bean|EventListener|Scheduled|PostConstruct|PreDestroy|Subscribe|RequestMapping|GetMapping|PostMapping|Nested)\b/.test(L[k]||'');
+    };
+    const deadMarkedComment=s=>{
+      const L=fileLines[s.file]||[];let k=s.line-2;while(k>=0&&!(L[k]||'').trim())k--;
+      const ctx=(L[k]||'')+' '+(s.body||'').split('\n').slice(0,3).join(' ');
+      return /\b(TODO:?\s*remove|DEPRECATED|@deprecated|no longer used|dead code)\b/i.test(ctx)||/\bunused\b/i.test(L[k]||'');
+    };
+    const isMiddlewareSig=s=>{
+      const p=(s.params||[]).map(x=>x.replace(/[:=].*/,'').replace(/[^\w$]/g,'').toLowerCase()).filter(Boolean);
+      if(p.length<3||p.length>4)return false;
+      const mw=new Set(['req','res','next','err','ctx','request','response','error']);
+      return p.filter(x=>mw.has(x)).length>=2;
+    };
+    // duplicate-body detection (identical normalized bodies → all but the first are dead duplicates)
+    const bodyKey=s=>{const b=(s.body||'').split('\n').slice(1).join('\n').replace(/\s+/g,' ').trim();return b.length>=40?b:null;};
+    const bodyMap=Object.create(null);
+    for(const s of allSymbols){if(s.kind!=='function')continue;const k=bodyKey(s);if(k)(bodyMap[k]=bodyMap[k]||[]).push(s);}
+    const isDuplicate=s=>{const k=bodyKey(s);return !!(k&&bodyMap[k]&&bodyMap[k].length>1);};
+
     for(const s of allSymbols){
       if(s.kind!=='function')continue;
-      const isPyFile=s.file.endsWith('.py');
-      const isMagic=/^__\w+__$/.test(s.name);
-      // single/double leading-underscore (non-dunder) in Python = intentionally private → respected
-      if(isPyFile&&/^_/.test(s.name)&&!isMagic)continue;
-      const called=(reverseCall[s.name]||[]).length>0;
-      const referenced=(refCount[s.name]||0)>1;          // >1 = referenced in real code elsewhere
-      const usedAsDecorator=decoratorNames.has(s.name);   // applied as @decorator → genuinely used
-      const isCalled=called||referenced||usedAsDecorator;
-      const isImported=importedNames.has(s.name);
-      // entry-point names and genuine test files are never "dead"
+      const n=s.name,ext=extOf(s.file),isPyFile=ext==='py',isJsFile=JSFAMILY.has(ext);
+      const called=(reverseCall[n]||[]).length>0;
+      const referenced=called||(refCount[n]||0)>1||decoratorNames.has(n)||importedNames.has(n);
+
+      // ── TIER 1: never flag — runtime-invoked / framework hooks / overrides ──
+      let exclude=null;
+      if(DUNDER.test(n))exclude='magic / dunder method';
+      else if(s.decorated)exclude='decorated (framework-invoked)';
+      else if(annotatedOrOverride(s))exclude='annotation / override (framework-invoked)';
+      else if(isJsFile&&JS_LIFECYCLE.has(n))exclude='framework lifecycle method';
+      else if(TEST_HOOKS.has(n))exclude='test hook';
+      else if(ANDROID_LIFECYCLE.has(n))exclude='Android lifecycle callback';
+      else if(isPyFile&&DJANGO_METHODS.has(n))exclude='Django / DRF framework method';
+      else if(isPyFile&&PY_HOOK_SUFFIX.test(n))exclude='hook naming convention';
+      else if(isPyFile&&/^test/.test(n))exclude='pytest test function';
+      else if(registeredNames.has(n)&&!called)exclude='registered as a runtime callback';
+      else if(isJsFile&&isMiddlewareSig(s))exclude='middleware signature (req/res/next)';
+      else if(defaultExportNames.has(n))exclude='default export (may be imported externally)';
+      else if(moduleExportNames.has(n))exclude='module.exports member';
+      if(exclude){
+        if(!called)deadExcluded.push({name:n,file:s.file,line:s.line,reason:exclude}); // surface things that "look" unused
+        continue;
+      }
+
+      // genuinely referenced in code → used; entry points & test files → skip
+      if(referenced)continue;
       const isTestFile=/(^|\/)(tests?|specs?|__tests__|__mocks__)\//i.test(s.file)
         || /\.(test|spec)\.[a-z]+$/i.test(s.file)
-        || /(^|\/)test_\w+\.py$/i.test(s.file)||/_test\.py$/i.test(s.file);
-      const isEntryName=/^(main|index|app|server|setup|init|default|render|handler|module|constructor)$/i.test(s.name);
-      // entry points and test files are never "dead" — but keep test fixtures (setUp/tearDown)
-      // so they surface as LOW-confidence rather than being silently hidden.
-      if((isEntryName&&!TEST_FIXTURE.test(s.name))||isTestFile)continue;
+        || /(^|\/)test_\w+\.py$/i.test(s.file)||/_test\.(py|go|js|ts)$/i.test(s.file);
+      if(/^(main|index|app|server|module|constructor|handler|bootstrap)$/i.test(n)||isTestFile)continue;
 
-      // unused candidate?
-      let baseKind=null;
-      if(s.exported&&!isImported)baseKind='unused-export';
-      else if(!s.exported&&!isCalled)baseKind='unused-function';
-      if(!baseKind)continue;
-
-      const reasons=lowConfidenceReasons(s,isPyFile);
-      if(reasons.length){
-        // LOW confidence — likely a framework hook or dynamic dispatch, not real dead code
-        deadCode.push({kind:'possibly-unused',confidence:'low',name:s.name,file:s.file,line:s.line,
-          signals:reasons,
-          reason:'May be called dynamically or by framework. Verify before removing. ('+reasons.join(', ')+')'});
-      }else{
-        // HIGH confidence — defined and never referenced by name anywhere
-        deadCode.push({kind:baseKind,confidence:'high',name:s.name,file:s.file,line:s.line,
-          reason:baseKind==='unused-export'
-            ?(isPyFile?`In __all__ / module-public but never imported across the analyzed set.`
-                      :`Exported but never imported anywhere in the analyzed set.`)
-            :`Function is never called within the analyzed files.`});
+      // ── TIER 2: verify before removing — possible external / dynamic / documented use ──
+      const namedExport=s.exported||allExports.has(n);
+      const isLibFile=/(?:^|\/)(utils?|helpers?|common|shared|lib|core|constants?)\b/i.test(s.file);
+      let verify=null;
+      if(namedExport&&!importedNames.has(n))verify='exported but never imported in the analyzed set — may have external consumers';
+      else if(stringTokens.has(n))verify='referenced as a string literal — may be dynamically dispatched';
+      else if(isLibFile)verify='public API in a library-style file (utils/helpers/common/shared)';
+      else if(commentTokens.has(n))verify='mentioned in a comment — may be a documented API';
+      if(verify){
+        deadCode.push({tier:'verify',confidence:'low',kind:'possibly-unused',name:n,file:s.file,line:s.line,
+          reason:'Verify before removing — '+verify+'.'});
+        continue;
       }
+
+      // ── TIER 3: high-confidence dead ──
+      let why='Defined and never referenced by name anywhere in the analyzed files.';
+      if(deadMarkedComment(s))why='Explicitly marked for removal (TODO/DEPRECATED/unused) and never referenced.';
+      else if(isDuplicate(s))why='Duplicate of another function with an identical body, and never referenced.';
+      else if(isPyFile&&/^_/.test(n))why='Private by convention (_name) and never referenced anywhere.';
+      else if(ext==='go'&&/^[a-z]/.test(n))why='Unexported (lowercase) in Go and never referenced anywhere.';
+      deadCode.push({tier:'dead',confidence:'high',kind:s.exported?'unused-export':'unused-function',
+        name:n,file:s.file,line:s.line,reason:why});
     }
 
     // circular dependency detection (Tarjan-lite DFS)
     const cycles=findCycles(importGraph);
 
     return {symbols:allSymbols,callGraph,reverseCall,importGraph,importedBy,
-      exportMap,deadCode,symByName,cycles,treeSitterReady};
+      exportMap,deadCode,deadExcluded,symByName,cycles,treeSitterReady};
   }
 
   function findCycles(graph){
@@ -2210,7 +2269,7 @@ const Correlator = (()=>{
     const security=clamp(100-sevSum(sec)*3/analyzable*2,0,100);
     const reliability=clamp(100-sevSum(bugs)*3/analyzable*2,0,100);
     const maintainability=clamp(100-sevSum(qual)*1.5/analyzable*2,0,100);
-    const deadPenalty=State.deadCode.length/analyzable*40;
+    const deadPenalty=State.deadCode.filter(d=>d.tier==='dead').length/analyzable*40;
     const cleanliness=clamp(100-deadPenalty,0,100);
     const avgComplexity=State.symbols.length?State.symbols.reduce((a,s)=>a+s.complexity,0)/State.symbols.length:1;
     const complexity=clamp(100-(avgComplexity-3)*8,0,100);
@@ -2268,9 +2327,9 @@ const QuickWins = (()=>{
         time:timeLabel(ease,false),title:f.title,file:f.file,line:f.line,
         impactText:impactText(f),before:f.snippet,after:f.fixedCode});
     }
-    // 2) dead code deletions (trivial, safe) — HIGH confidence only; LOW (verify) is not a quick win
+    // 2) dead code deletions (trivial, safe) — Tier 3 (definitely dead) only; verify is not a quick win
     for(const d of State.deadCode){
-      if(d.confidence==='low')continue;
+      if(d.tier!=='dead')continue;
       const sym=State.symbols.find(s=>s.name===d.name&&s.file===d.file);
       const span=sym?(sym.endLine-sym.line+1):1;
       const ease=span<=5?10:span<=20?8:5;
@@ -3098,7 +3157,7 @@ async function runAnalysis(allFiles){
   const ast=await ASTEngine.run(files);
   State.symbols=ast.symbols;State.callGraph=ast.callGraph;State.reverseCall=ast.reverseCall;
   State.importGraph=ast.importGraph;State.importedBy=ast.importedBy;State.exportMap=ast.exportMap;
-  State.deadCode=ast.deadCode;State.cycles=ast.cycles;State.symByName=ast.symByName;
+  State.deadCode=ast.deadCode;State.deadExcluded=ast.deadExcluded;State.cycles=ast.cycles;State.symByName=ast.symByName;
   setStep('symbols','done',State.symbols.length+' symbols found');
 
   // STEP 2b (graphs)
@@ -3559,31 +3618,48 @@ function codeFromTextPlain(text){
 function renderDeadCode(){
   const p=$('#panel-deadcode');p.innerHTML='';
   p.append(el('div',{class:'section-title'},'💀 Dead Code'));
-  if(!State.deadCode.length){p.append(el('div',{class:'empty'},el('div',{class:'big'},'✓'),
-    el('div',{},'No dead code detected.')));return;}
-  const hi=State.deadCode.filter(d=>d.confidence!=='low').length;
-  const lo=State.deadCode.filter(d=>d.confidence==='low').length;
-  p.append(el('div',{class:'dead-counts'},
-    el('span',{class:'dc-hi'},`High confidence: ${hi}`),
-    el('span',{class:'dc-sep'},'|'),
-    el('span',{class:'dc-lo'},`Verify manually: ${lo}`)));
-  p.append(el('p',{class:'muted',style:'margin-bottom:12px'},
-    'High confidence = defined and never referenced anywhere (likely safe to delete). '+
-    'Verify manually = may be invoked by a framework or dynamic dispatch — confirm before removing.'));
-  // HIGH confidence first, then LOW (verify) — sorted within the list
-  const ordered=[...State.deadCode].sort((a,b)=>(a.confidence==='low'?1:0)-(b.confidence==='low'?1:0));
-  for(const d of ordered){
-    const low=d.confidence==='low';
-    const c=el('div',{class:'finding '+(low?'sev-med':'sev-info')},
-      el('div',{class:'finding-head',onClick:e=>e.currentTarget.parentElement.classList.toggle('open')},
-        el('span',{class:'badge2 '+(low?'b-med':'b-info')},low?'POSSIBLY-UNUSED':d.kind.toUpperCase()),
-        el('span',{class:'finding-title'},d.name),
-        el('span',{class:'finding-loc',onClick:e=>{e.stopPropagation();openInFile(d.file,d.line);}},
-          basename(d.file)+':'+d.line)),
-      el('div',{class:'finding-body'},el('p',{},d.reason),
-        SearchEngine.snippet(d.file,d.line,2).length?codeCtx(d.file,d.line):''));
-    p.append(c);
-  }
+  const dead=State.deadCode.filter(d=>d.tier==='dead');
+  const verify=State.deadCode.filter(d=>d.tier==='verify');
+  const excluded=State.deadExcluded||[];
+  p.append(el('p',{class:'muted',style:'margin-bottom:14px'},
+    'Static analysis cannot see: decorator-applied functions, dynamic dispatch, external consumers, '+
+    'runtime hooks, and reflection calls. These are excluded automatically.'));
+  if(!dead.length&&!verify.length&&!excluded.length){
+    p.append(el('div',{class:'empty'},el('div',{class:'big'},'✓'),el('div',{},'No dead code detected.')));return;}
+
+  const card=(d,kind)=>el('div',{class:'finding '+(kind==='dead'?'sev-crit':'sev-med')},
+    el('div',{class:'finding-head',onClick:e=>e.currentTarget.parentElement.classList.toggle('open')},
+      el('span',{class:'badge2 '+(kind==='dead'?'b-crit':'b-med')},kind==='dead'?'DEAD':'VERIFY'),
+      el('span',{class:'finding-title'},d.name),
+      el('span',{class:'finding-loc',onClick:e=>{e.stopPropagation();openInFile(d.file,d.line);}},
+        basename(d.file)+':'+d.line)),
+    el('div',{class:'finding-body'},el('p',{},d.reason),
+      SearchEngine.snippet(d.file,d.line,2).length?codeCtx(d.file,d.line):''));
+
+  // ☠ Tier 3 — definitely dead
+  p.append(el('div',{class:'dead-sec dead-t3'},'☠ Definitely Dead — '+dead.length+' found',
+    el('span',{class:'dead-sub'},'high confidence · safe to delete')));
+  if(dead.length)dead.forEach(d=>p.append(card(d,'dead')));
+  else p.append(el('p',{class:'muted',style:'margin:0 0 16px'},'None — no high-confidence dead code. ✓'));
+
+  // ⚠ Tier 2 — verify before removing
+  p.append(el('div',{class:'dead-sec dead-t2'},'⚠ Verify Before Removing — '+verify.length+' found',
+    el('span',{class:'dead-sub'},'may have external consumers or dynamic callers')));
+  if(verify.length)verify.forEach(d=>p.append(card(d,'verify')));
+  else p.append(el('p',{class:'muted',style:'margin:0 0 16px'},'None.'));
+
+  // ℹ Tier 1 — excluded from analysis (collapsible)
+  const det=el('details',{class:'dead-excluded'});
+  det.append(el('summary',{},'ℹ Excluded from analysis — '+excluded.length+' item(s) · runtime-called, framework hooks, overrides'));
+  if(excluded.length){
+    const list=el('div',{class:'excluded-list'});
+    for(const e of excluded)list.append(el('div',{class:'excluded-row',onClick:()=>openInFile(e.file,e.line)},
+      el('span',{class:'mono ex-name'},e.name),
+      el('span',{class:'ex-loc'},basename(e.file)+':'+e.line),
+      el('span',{class:'ex-why'},'— '+e.reason)));
+    det.append(list);
+  }else det.append(el('p',{class:'muted',style:'padding:6px 2px'},'Nothing excluded.'));
+  p.append(det);
 }
 function codeCtx(file,line){
   const snips=SearchEngine.snippet(file,line,2);const wrap=el('div',{class:'codeblock'});
@@ -3899,7 +3975,7 @@ function showBanner(text){$('#banner-text').textContent=text;$('#banner').classL
 // Phase 6: "Analyze another" clears all analysis state and returns to input
 function resetAndReturnToInput(){
   Object.assign(State,{files:[],context:null,symbols:[],callGraph:{},reverseCall:{},
-    importGraph:{},importedBy:{},exportMap:{},deadCode:[],taintFlows:[],routes:[],
+    importGraph:{},importedBy:{},exportMap:{},deadCode:[],deadExcluded:[],taintFlows:[],routes:[],
     findings:[],grouped:{security:[],bugs:[],quality:[],architecture:[]},fileHealth:{},
     arch:null,summary:null,cycles:[],spaghetti:null,healthAxes:{overall:0,axes:[]}});
   ['overview','quickwins','security','bugs','quality','architecture','spaghetti','deadcode','graph']
