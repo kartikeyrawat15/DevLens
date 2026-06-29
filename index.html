@@ -309,6 +309,11 @@ code,pre,.mono{font-family:var(--mono)}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
 .key-status{font-size:11px;font-family:var(--mono);margin-top:4px}
 .key-status.ok{color:var(--green)} .key-status.no{color:var(--fg3)}
+.field select{margin-bottom:6px}
+.prov-warn{padding:8px 10px;border:1px solid var(--yellow);background:rgba(218,170,63,.08);border-radius:8px;font-size:11.5px;color:var(--yellow);margin:0 0 16px;line-height:1.5}
+.tier-ind{padding:9px 11px;border-radius:8px;font-size:12.5px;font-weight:600;margin:2px 0 16px;border:1px solid var(--border);color:var(--fg2)}
+.tier-ind.t2{color:var(--yellow);border-color:var(--yellow)}
+.tier-ind.t3{color:var(--accent);border-color:var(--accent);background:var(--bg3)}
 
 /* ---------- Banners / toast ---------- */
 #banner{display:none;padding:9px 16px;background:var(--yellow-bg);color:var(--yellow);
@@ -558,19 +563,33 @@ details.impact[open]>summary::before{content:'▾ '}
 <!-- SETTINGS MODAL -->
 <div class="modal-bg" id="settings-modal"><div class="modal">
   <h2>Settings</h2>
-  <div class="msub">Keys are stored in <code>localStorage</code> on this device only. Used solely for direct API calls from your browser.</div>
+  <div class="msub">Add any key to either slot — free or paid both work. Different providers per slot gives most accurate results.</div>
+  <div class="msub" style="margin-top:-12px">Keys are stored in <code>localStorage</code> on this device only. Used solely for direct API calls from your browser.</div>
   <div class="field">
-    <label>Gemini API Key <span class="muted">(generate &amp; fix findings)</span></label>
-    <div class="hint">Free at aistudio.google.com → "Get API key". Model: gemini-2.0-flash.</div>
-    <input id="key-gemini" type="password" placeholder="AIza...">
-    <div class="key-status no" id="status-gemini">not set</div>
+    <label>Generator <span class="muted">— finds bugs, writes fixes</span></label>
+    <div class="hint">Gemini Flash is free (1,500/day) · Claude and GPT-4o give better results on complex code</div>
+    <select id="gen-provider">
+      <option value="gemini">Gemini (free)</option>
+      <option value="openai">OpenAI</option>
+      <option value="anthropic">Anthropic</option>
+    </select>
+    <input id="gen-key" type="password" placeholder="API key">
+    <div class="key-status no" id="status-gen">not set</div>
   </div>
+  <div id="same-provider-warn" class="prov-warn" style="display:none"></div>
   <div class="field">
-    <label>Groq API Key <span class="muted">(DeepSeek R1 validator)</span></label>
-    <div class="hint">Free at console.groq.com → "API Keys". Model: deepseek-r1-distill-llama-70b.</div>
-    <input id="key-groq" type="password" placeholder="gsk_...">
-    <div class="key-status no" id="status-groq">not set</div>
+    <label>Validator <span class="muted">— checks every finding for accuracy</span></label>
+    <div class="hint">Groq + DeepSeek R1 is free (14,400/day) · use a different provider than Generator for best results</div>
+    <select id="val-provider">
+      <option value="groq">Groq/DeepSeek R1 (free)</option>
+      <option value="openai">OpenAI</option>
+      <option value="anthropic">Anthropic</option>
+      <option value="gemini">Gemini</option>
+    </select>
+    <input id="val-key" type="password" placeholder="API key">
+    <div class="key-status no" id="status-val">not set</div>
   </div>
+  <div id="tier-indicator" class="tier-ind"></div>
   <div class="field">
     <label>GitHub Token <span class="muted">(optional — raises rate limit)</span></label>
     <div class="hint">Unauthenticated GitHub API allows 60 req/hr. A token raises it to 5000/hr.</div>
@@ -669,7 +688,9 @@ const State = {
   arch: null,           // AI architecture markdown
   summary: null,        // AI exec summary
   mode: 'senior',
-  keys: { gemini:'', groq:'', github:'' },
+  keys: { github:'' },
+  gen: { provider:'gemini', key:'' },   // Generator slot — finds bugs, writes fixes
+  val: { provider:'groq',   key:'' },   // Validator slot — checks every finding
   aiAvailable:false,
   aiUsed:false,
 };
@@ -1769,8 +1790,33 @@ const AuthMapper = (()=>{
 const AIOrchestrator = (()=>{
   const GEMINI_URL=m=>`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`;
   const GROQ_URL='https://api.groq.com/openai/v1/chat/completions';
+  const OPENAI_URL='https://api.openai.com/v1/chat/completions';
+  const ANTHROPIC_URL='https://api.anthropic.com/v1/messages';
   const GEMINI_MODEL='gemini-2.0-flash';
   const GROQ_MODEL='deepseek-r1-distill-llama-70b';
+  const OPENAI_MODEL='gpt-4o';
+  const ANTHROPIC_MODEL='claude-sonnet-4-6';
+  const PROVIDER_LABELS={gemini:'Gemini',groq:'Groq/DeepSeek',openai:'OpenAI',anthropic:'Anthropic'};
+
+  /* ── Tier system: capability + thresholds inferred from selected providers ── */
+  // anthropic (claude-sonnet/opus) → tier 3 · openai (gpt-4o) / gemini-pro → tier 2 · free → tier 1
+  function slotTier(p){return p==='anthropic'?3:p==='openai'?2:1;}
+  function tierInfo(gp,vp){
+    const gt=slotTier(gp),vt=slotTier(vp);
+    const tier=Math.max(gt,vt);
+    const bothTier3=gt===3&&vt===3;
+    const base={
+      1:{confidence_threshold:85,max_attempts:3,chunk_size:6000},
+      2:{confidence_threshold:88,max_attempts:2,chunk_size:10000},
+      3:{confidence_threshold:92,max_attempts:2,chunk_size:15000},
+    }[tier];
+    const label= tier===1 ? '⚡ Standard analysis — good for most repos'
+      : tier===2 ? '🔥 Enhanced analysis — higher accuracy'
+      : bothTier3 ? '🚀 Premium analysis — bonus review pass on critical findings'
+      : '🚀 Premium analysis — principal engineer mode';
+    return {tier,bothTier3,label,...base};
+  }
+  function getTierConfig(){return tierInfo(State.gen.provider,State.val.provider);}
 
   async function backoffFetch(url,opts,label){
     let delay=800;
@@ -1805,24 +1851,58 @@ const AIOrchestrator = (()=>{
     try{return JSON.parse(t.slice(start));}catch{return null;}
   }
 
-  async function callGemini(prompt){
+  async function callGemini(prompt,key){
     const body={contents:[{parts:[{text:prompt}]}],
       generationConfig:{temperature:0.2,maxOutputTokens:2048}};
-    const res=await backoffFetch(GEMINI_URL(GEMINI_MODEL)+'?key='+encodeURIComponent(State.keys.gemini),
+    const res=await backoffFetch(GEMINI_URL(GEMINI_MODEL)+'?key='+encodeURIComponent(key||State.gen.key),
       {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},'Gemini');
     const j=await res.json();
     return j.candidates?.[0]?.content?.parts?.[0]?.text||'';
   }
 
-  async function callGroq(prompt){
+  async function callGroq(prompt,key){
     const body={model:GROQ_MODEL,temperature:0.1,max_tokens:2048,
       messages:[{role:'user',content:prompt}]};
     const res=await backoffFetch(GROQ_URL,{method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':'Bearer '+State.keys.groq},
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+(key||State.val.key)},
       body:JSON.stringify(body)},'Groq');
     const j=await res.json();
     return j.choices?.[0]?.message?.content||'';
   }
+
+  async function callOpenAI(prompt,key){
+    const body={model:OPENAI_MODEL,temperature:0.1,max_tokens:2048,
+      messages:[{role:'user',content:prompt}]};
+    const res=await backoffFetch(OPENAI_URL,{method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},
+      body:JSON.stringify(body)},'OpenAI');
+    const j=await res.json();
+    return j.choices?.[0]?.message?.content||'';
+  }
+
+  async function callAnthropic(prompt,key){
+    const body={model:ANTHROPIC_MODEL,max_tokens:2048,temperature:0.1,
+      messages:[{role:'user',content:prompt}]};
+    const res=await backoffFetch(ANTHROPIC_URL,{method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':key,
+        'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+      body:JSON.stringify(body)},'Anthropic');
+    const j=await res.json();
+    return (j.content||[]).map(b=>b.text||'').join('')||'';
+  }
+
+  // route a prompt to the provider chosen for a slot (generator or validator)
+  function routeCall(slot,prompt){
+    switch(slot.provider){
+      case 'openai':    return callOpenAI(prompt,slot.key);
+      case 'anthropic': return callAnthropic(prompt,slot.key);
+      case 'groq':      return callGroq(prompt,slot.key);
+      case 'gemini':    return callGemini(prompt,slot.key);
+      default:          return callGemini(prompt,slot.key);
+    }
+  }
+  const callGenerator=prompt=>routeCall(State.gen,prompt);
+  const callValidator=prompt=>routeCall(State.val,prompt);
 
   function buildPrompt(task,code,context,critique){
     let p=`You are a meticulous senior code auditor. ${task}\n\n`;
@@ -1835,16 +1915,45 @@ const AIOrchestrator = (()=>{
     return p;
   }
 
-  // The exact confidence loop from the spec, generalized to multi-finding
+  // Tier-3 bonus pass: a principal-engineer final review of each critical/high finding.
+  // Returns the list of findings whose review was NOT confirmed (with their critiques).
+  async function bonusReview(findings,code,context){
+    const problems=[];
+    for(const f of findings){
+      if((f.severity||0)<7)continue;            // CRITICAL/HIGH only — skip MEDIUM/LOW
+      if((f.confidence||0)<92)continue;
+      const rev=await callValidator(
+`You are a principal engineer doing final review.
+Here is a finding that passed confidence validation:
+${JSON.stringify(f).slice(0,2000)}
+
+Here is the actual code it refers to:
+${code}
+
+Find anything the analysis missed. Look for:
+edge cases, false positive risk, incomplete fix, missing blast radius items.
+
+If correct respond: CONFIRMED
+If issues found: describe them.`);
+      const clean=(rev||'').replace(/<think>[\s\S]*?<\/think>/gi,'').trim();
+      if(!/^CONFIRMED\b/i.test(clean)){
+        problems.push({finding:f,critique:clean.slice(0,300)||'principal review not confirmed'});
+      }
+    }
+    return problems;
+  }
+
+  // The confidence loop, tier-aware (threshold / attempts / chunk from getTierConfig).
   async function analyzeWithConfidence(task,code,context,onAttempt){
-    const MAX=3;let attempt=0;let lastCritique=null;
-    while(attempt<MAX){
-      onAttempt&&onAttempt(attempt+1,MAX);
-      const genText=await callGemini(buildPrompt(task,code,context,lastCritique));
+    const {confidence_threshold,max_attempts,bothTier3}=getTierConfig();
+    let attempt=0;let lastCritique=null;let bonusUsed=false;
+    while(attempt<max_attempts){
+      onAttempt&&onAttempt(attempt+1,max_attempts);
+      const genText=await callGenerator(buildPrompt(task,code,context,lastCritique));
       const findings=extractJSON(genText)||[];
       if(!Array.isArray(findings)||findings.length===0)return [];
 
-      const valText=await callGroq(
+      const valText=await callValidator(
 `Here is a set of code analysis findings (JSON):
 ${JSON.stringify(findings).slice(0,4000)}
 
@@ -1856,20 +1965,31 @@ Tasks:
 2. Check the logic of each finding is sound (no false positives).
 3. Check each "fixedCode" actually resolves the issue.
 4. Score overall confidence 0-100.
-5. If score < 85, explain exactly what is wrong.
+5. If score < ${confidence_threshold}, explain exactly what is wrong.
 
 Respond ONLY in JSON: { "confidence": number, "critique": string|null, "approved": boolean }`);
       const val=extractJSON(valText)||{confidence:70,critique:'validator returned no JSON',approved:false};
 
-      if((val.confidence||0)>=85){
-        return findings.map(f=>({...f,confidence:val.confidence}));
+      if((val.confidence||0)>=confidence_threshold){
+        const results=findings.map(f=>({...f,confidence:val.confidence}));
+        // TIER 3 BONUS PASS — both slots are Tier-3 models: extra principal review of crit/high findings
+        if(bothTier3&&!bonusUsed){
+          const problems=await bonusReview(results,code,context);
+          if(problems.length){
+            problems.forEach(p=>{p.finding.confidence=75;p.finding.flaggedForReview=true;});
+            lastCritique='Principal review found issues that must be addressed:\n'+
+              problems.map(p=>`• ${p.finding.title}: ${p.critique}`).join('\n');
+            bonusUsed=true;attempt++;continue;   // confidence dropped to 75 → one more retry
+          }
+        }
+        return results;
       }
       lastCritique=val.critique||'low confidence';
       attempt++;
     }
-    // tiebreaker — opposite model (Groq) generates directly
+    // tiebreaker — validator provider generates directly (opposite model from generator)
     try{
-      const tbText=await callGroq(buildPrompt(task,code,context,lastCritique));
+      const tbText=await callValidator(buildPrompt(task,code,context,lastCritique));
       const tb=extractJSON(tbText)||[];
       return (Array.isArray(tb)?tb:[]).map(f=>({...f,confidence:60,flaggedForReview:true}));
     }catch{return [];}
@@ -1878,20 +1998,21 @@ Respond ONLY in JSON: { "confidence": number, "critique": string|null, "approved
   async function architectureExplain(context,fileList,topSymbols){
     const task=`Explain this codebase's architecture for an engineer new to it. Cover: overall structure & layers, main responsibilities, notable patterns, and a concrete "spaghetti untangle" plan listing the top 3 refactors in priority order. Use markdown with ## and ### headings. Be specific to the code, not generic.`;
     const code=`Files:\n${fileList.join('\n')}\n\nKey symbols:\n${topSymbols.slice(0,40).map(s=>`${s.kind} ${s.name} @ ${basename(s.file)}:${s.line} (cx ${s.complexity})`).join('\n')}`;
-    return await callGemini(buildPrompt(task,code,context,null).replace(/Respond ONLY with a JSON[\s\S]*$/,'Respond in markdown prose.'));
+    return await callGenerator(buildPrompt(task,code,context,null).replace(/Respond ONLY with a JSON[\s\S]*$/,'Respond in markdown prose.'));
   }
   async function executiveSummary(context,findings){
     const top=findings.slice(0,20).map(f=>`[${f.category}/sev${f.severity}] ${f.title} (${basename(f.file)}:${f.line})`).join('\n');
     const task=`Write a 4-6 sentence executive summary of this codebase's health for a tech lead. Mention the most serious risks by name, overall posture, and the single highest-priority action. Plain prose, no JSON.`;
-    return await callGemini(buildPrompt(task,top,context,null).replace(/Respond ONLY with a JSON[\s\S]*$/,'Respond in plain prose.'));
+    return await callGenerator(buildPrompt(task,top,context,null).replace(/Respond ONLY with a JSON[\s\S]*$/,'Respond in plain prose.'));
   }
   async function explainSymbol(sym,context){
     const task=`In 2-3 sentences, explain what the function "${sym.name}" does and any concern with it.`;
-    return await callGemini(buildPrompt(task,sym.body.slice(0,3000),context,null).replace(/Respond ONLY with a JSON[\s\S]*$/,'Respond in plain prose.'));
+    return await callGenerator(buildPrompt(task,sym.body.slice(0,3000),context,null).replace(/Respond ONLY with a JSON[\s\S]*$/,'Respond in plain prose.'));
   }
 
   return {analyzeWithConfidence,architectureExplain,executiveSummary,explainSymbol,
-    callGemini,callGroq,extractJSON};
+    callGenerator,callValidator,callGemini,callGroq,callOpenAI,callAnthropic,
+    getTierConfig,tierInfo,PROVIDER_LABELS,extractJSON};
 })();
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -2667,7 +2788,7 @@ const OutputEngine = (()=>{
     if(!cardEl.classList.contains('open'))cardEl.classList.toggle('open');
     let box=cardEl.querySelector('.ai-explain');
     if(box){box.remove();return;}
-    box=el('div',{class:'ai-explain'},el('span',{class:'spinner-inline'}),' Asking Gemini…');
+    box=el('div',{class:'ai-explain'},el('span',{class:'spinner-inline'}),' Asking AI…');
     cardEl.querySelector('.finding-body').prepend(box);
     try{
       const levels={vibe:'plain casual English, no jargon, like explaining to a friend',
@@ -2677,7 +2798,7 @@ const OutputEngine = (()=>{
       const prompt=`Explain this code finding to me as ${levels[State.mode]}.\n`+
         `Finding: ${f.title}\nFile: ${f.file}:${f.line}\nDetail: ${f.description}\n`+
         `Code: ${f.snippet}\n\nKeep it under 5 sentences. Plain prose.`;
-      const txt=await AIOrchestrator.callGemini(prompt);
+      const txt=await AIOrchestrator.callGenerator(prompt);
       box.innerHTML='';box.append(el('b',{},'✨ '),document.createTextNode(txt.replace(/<think>[\s\S]*?<\/think>/g,'').trim()));
     }catch(e){box.innerHTML='';box.append('AI explain failed: '+e.message);}
   }
@@ -2902,7 +3023,7 @@ async function runAnalysis(allFiles){
   // STEP 6 — AI (optional)
   State.aiUsed=false;
   if(State.aiAvailable){
-    setStep('ai','active','attempt 1/3');
+    setStep('ai','active','Tier '+AIOrchestrator.getTierConfig().tier+' · starting');
     try{
       const aiFindings=await runAIAnalysis(files);
       staticFindings=staticFindings.concat(aiFindings);
@@ -2938,14 +3059,15 @@ async function runAnalysis(allFiles){
 }
 
 async function runAIAnalysis(files){
-  // pick top analyzable files by complexity, chunk to ~8000 token budget
+  // pick top analyzable files by complexity; chunk budget scales with the selected tier
   const targets=files.filter(f=>ANALYZABLE.has(f.ext))
     .sort((a,b)=>b.loc-a.loc).slice(0,6);
+  const charBudget=AIOrchestrator.getTierConfig().chunk_size*4; // ~4 chars/token
   const out=[];
   for(let i=0;i<targets.length;i++){
     const f=targets[i];
     setStep('ai','active',`file ${i+1}/${targets.length}: ${basename(f.path)}`);
-    const numbered=f.content.split('\n').map((l,n)=>`${n+1}: ${l}`).join('\n').slice(0,16000);
+    const numbered=f.content.split('\n').map((l,n)=>`${n+1}: ${l}`).join('\n').slice(0,charBudget);
     const task=`Find real LOGIC BUGS and security issues in this file (${basename(f.path)}) that a static linter would MISS — race conditions, wrong conditionals, off-by-one, missing await, broken error handling, auth logic flaws. Be precise about line numbers.`;
     try{
       const findings=await AIOrchestrator.analyzeWithConfidence(task,numbered,State.context,
@@ -3600,36 +3722,58 @@ function exportPDF(){
    SETTINGS + UI WIRING + MAIN
    ════════════════════════════════════════════════════════════════════════ */
 function loadKeys(){
-  State.keys.gemini=localStorage.getItem('dl_gemini')||'';
-  State.keys.groq=localStorage.getItem('dl_groq')||'';
+  // Generator + Validator slots; fall back to legacy dl_gemini/dl_groq for existing users.
+  State.gen={provider:localStorage.getItem('dl_generator_provider')||'gemini',
+             key:localStorage.getItem('dl_generator_key')||localStorage.getItem('dl_gemini')||''};
+  State.val={provider:localStorage.getItem('dl_validator_provider')||'groq',
+             key:localStorage.getItem('dl_validator_key')||localStorage.getItem('dl_groq')||''};
   State.keys.github=localStorage.getItem('dl_github')||'';
   State.mode=localStorage.getItem('dl_mode')||'senior';
-  State.aiAvailable=!!(State.keys.gemini&&State.keys.groq);
+  State.aiAvailable=!!(State.gen.key&&State.val.key);
 }
 function openSettings(){
-  $('#key-gemini').value=State.keys.gemini;
-  $('#key-groq').value=State.keys.groq;
+  $('#gen-provider').value=State.gen.provider;
+  $('#gen-key').value=State.gen.key;
+  $('#val-provider').value=State.val.provider;
+  $('#val-key').value=State.val.key;
   $('#key-github').value=State.keys.github;
   $$('.mode-opt').forEach(o=>o.classList.toggle('active',o.dataset.mode===State.mode));
-  updateKeyStatus();
+  updateSettingsUI();
   $('#settings-modal').classList.add('show');
 }
-function updateKeyStatus(){
-  const g=$('#status-gemini'),q=$('#status-groq');
-  g.textContent=State.keys.gemini?'✓ set':'not set';g.className='key-status '+(State.keys.gemini?'ok':'no');
-  q.textContent=State.keys.groq?'✓ set':'not set';q.className='key-status '+(State.keys.groq?'ok':'no');
+function updateSettingsUI(){
+  const gp=$('#gen-provider').value,gk=$('#gen-key').value.trim();
+  const vp=$('#val-provider').value,vk=$('#val-key').value.trim();
+  const setStat=(node,k)=>{node.textContent=k?'✓ set':'not set';node.className='key-status '+(k?'ok':'no');};
+  setStat($('#status-gen'),gk);setStat($('#status-val'),vk);
+  // same-provider warning — only when both dropdowns match AND both keys are set
+  const warn=$('#same-provider-warn');
+  if(gp===vp&&gk&&vk){
+    warn.style.display='block';
+    warn.textContent=`⚠ Generator and Validator are both ${AIOrchestrator.PROVIDER_LABELS[gp]}. `+
+      `For best results use different providers — a model checking its own work misses its own mistakes.`;
+  }else warn.style.display='none';
+  // tier indicator (preview from current dropdown selections)
+  const t=AIOrchestrator.tierInfo(gp,vp);
+  const ind=$('#tier-indicator');
+  ind.textContent=t.label;
+  ind.className='tier-ind t'+t.tier;
 }
 function saveSettings(){
-  State.keys.gemini=$('#key-gemini').value.trim();
-  State.keys.groq=$('#key-groq').value.trim();
+  State.gen.provider=$('#gen-provider').value;
+  State.gen.key=$('#gen-key').value.trim();
+  State.val.provider=$('#val-provider').value;
+  State.val.key=$('#val-key').value.trim();
   State.keys.github=$('#key-github').value.trim();
-  localStorage.setItem('dl_gemini',State.keys.gemini);
-  localStorage.setItem('dl_groq',State.keys.groq);
+  localStorage.setItem('dl_generator_provider',State.gen.provider);
+  localStorage.setItem('dl_generator_key',State.gen.key);
+  localStorage.setItem('dl_validator_provider',State.val.provider);
+  localStorage.setItem('dl_validator_key',State.val.key);
   localStorage.setItem('dl_github',State.keys.github);
   localStorage.setItem('dl_mode',State.mode);
-  State.aiAvailable=!!(State.keys.gemini&&State.keys.groq);
+  State.aiAvailable=!!(State.gen.key&&State.val.key);
   $('#settings-modal').classList.remove('show');
-  toast('Settings saved'+(State.aiAvailable?' — AI enabled':''),'ok');
+  toast('Settings saved'+(State.aiAvailable?' — AI enabled (Tier '+AIOrchestrator.getTierConfig().tier+')':''),'ok');
   if(State.files.length){$('#pill-mode').textContent='Mode: '+State.mode.toUpperCase();renderAll();}
 }
 function showBanner(text){$('#banner-text').textContent=text;$('#banner').classList.add('show');}
@@ -3727,8 +3871,12 @@ function main(){
   $('#settings-modal').addEventListener('click',e=>{if(e.target.id==='settings-modal')$('#settings-modal').classList.remove('show');});
   $$('.mode-opt').forEach(o=>o.addEventListener('click',()=>{
     State.mode=o.dataset.mode;$$('.mode-opt').forEach(x=>x.classList.remove('active'));o.classList.add('active');}));
-  ['key-gemini','key-groq'].forEach(id=>$('#'+id).addEventListener('input',()=>{
-    State.keys.gemini=$('#key-gemini').value.trim();State.keys.groq=$('#key-groq').value.trim();updateKeyStatus();}));
+  // Generator / Validator slot wiring — providers (change) + keys (input) drive live UI
+  [['gen-provider','change'],['gen-key','input'],['val-provider','change'],['val-key','input']]
+    .forEach(([id,ev])=>$('#'+id).addEventListener(ev,()=>{
+      State.gen.provider=$('#gen-provider').value;State.gen.key=$('#gen-key').value.trim();
+      State.val.provider=$('#val-provider').value;State.val.key=$('#val-key').value.trim();
+      updateSettingsUI();}));
 
   // bottom bar
   $('#btn-newrepo').addEventListener('click',resetAndReturnToInput);
