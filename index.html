@@ -314,6 +314,8 @@ code,pre,.mono{font-family:var(--mono)}
 .tier-ind{padding:9px 11px;border-radius:8px;font-size:12.5px;font-weight:600;margin:2px 0 16px;border:1px solid var(--border);color:var(--fg2)}
 .tier-ind.t2{color:var(--yellow);border-color:var(--yellow)}
 .tier-ind.t3{color:var(--accent);border-color:var(--accent);background:var(--bg3)}
+.dead-counts{display:flex;gap:10px;align-items:center;font-size:13px;font-weight:600;margin-bottom:6px}
+.dead-counts .dc-hi{color:var(--fg)} .dead-counts .dc-lo{color:var(--yellow)} .dead-counts .dc-sep{color:var(--fg3)}
 
 /* ---------- Banners / toast ---------- */
 #banner{display:none;padding:9px 16px;background:var(--yellow-bg);color:var(--yellow);
@@ -1281,9 +1283,21 @@ const ASTEngine = (()=>{
           const body=lines.slice(i,end+1).join('\n');
           const s=mkSym(pm[1],'function',file,i+1,end+1,pm[2],body);
           s.className=baseIndent>0?(currentClass?.name||null):null;
-          // decorator on the preceding non-blank line → framework hook (route/fixture/property), not dead
-          let k=i-1;while(k>=0&&!lines[k].trim())k--;
-          s.decorated=k>=0&&/^\s*@/.test(lines[k]);
+          // decorated def → framework hook (route/fixture/property), not dead.
+          // Walk up past blanks and any multi-line decorator call (paren-aware) to find an '@'.
+          s.decorated=(function(){
+            let k=i-1;while(k>=0&&!lines[k].trim())k--;
+            let depth=0,guard=0;
+            while(k>=0&&guard++<20){
+              const t=lines[k];
+              if(!t.trim()){if(depth>0){k--;continue;}break;}
+              depth+=(t.match(/\)/g)||[]).length-(t.match(/\(/g)||[]).length;
+              if(/^\s*@/.test(t))return true;       // decorator (handles stacked decorators too)
+              if(depth<=0)break;                     // not a decorator, not inside a decorator's parens
+              k--;
+            }
+            return false;
+          })();
           symbols.push(s);
         }else if((pm=PY_CLASS.exec(line))){
           symbols.push(mkSym(pm[1],'class',file,i+1,i+1,'',line));
@@ -1417,46 +1431,100 @@ const ASTEngine = (()=>{
       const re2=/const\s+\{([^}]*)\}\s*=\s*require/g;
       while((im=re2.exec(txt)))im[1].split(',').forEach(n=>importedNames.add(n.trim()));
     }
-    // bare-reference frequency across the corpus (catches middleware/callbacks
-    // passed by name, e.g. router.get(path, authenticate, handler))
+    // bare-reference frequency across the corpus (catches middleware/callbacks passed by
+    // name). String- and comment-aware: a name that appears ONLY inside a string (e.g. an
+    // __all__ entry or a getattr('name') target) or a comment is NOT a real code reference,
+    // so it still counts as unreferenced — those cases are surfaced as LOW-confidence below.
+    const stripStrCom=(src,isPy)=>{
+      let s=src;
+      if(isPy)s=s.replace(/'''[\s\S]*?'''/g,'').replace(/"""[\s\S]*?"""/g,'');
+      s=s.replace(/'(?:\\.|[^'\\])*'/g,'').replace(/"(?:\\.|[^"\\])*"/g,'');
+      return isPy?s.replace(/#.*$/gm,''):s.replace(/\/\/.*$/gm,'').replace(/\/\*[\s\S]*?\*\//g,'');
+    };
     const refCount=Object.create(null);
     for(const f of files){
       if(!ANALYZABLE.has(f.ext))continue;
-      let tm;const tok=/[A-Za-z_$][\w$]*/g;
-      while((tm=tok.exec(f.content)))refCount[tm[0]]=(refCount[tm[0]]||0)+1;
+      let tm;const tok=/[A-Za-z_$][\w$]*/g;const code=stripStrCom(f.content,f.ext==='py');
+      while((tm=tok.exec(code)))refCount[tm[0]]=(refCount[tm[0]]||0)+1;
+    }
+    /* ── Dead-code confidence signals (any present → LOW "verify", none → HIGH "real") ── */
+    const PY_FRAMEWORK_HOOKS=new Set(['make_shell_context','create_url_adapter',
+      'create_jinja_environment','iter_blueprints','create_global_jinja_loader',
+      'open_resource','make_null_session']);
+    const HOOK_AFFIX=/(_handler|_context|_loader|_processor|_receiver|_command|_task|_view)$|^(handler|context|loader|processor|receiver|command|task|view)_/i;
+    const TEST_FIXTURE=/^(setUp|tearDown|setUpClass|tearDownClass|setUpModule|tearDownModule)$|^fixture_/;
+    // names declared in any __all__ anywhere in the codebase → public API surface
+    const allExports=new Set();
+    for(const f of files){
+      let am;const are=/__all__\s*=\s*[\[(]([^\])]*)[\])]/g;
+      while((am=are.exec(f.content)))am[1].split(',').forEach(n=>{n=n.replace(/['"\s]/g,'');if(n)allExports.add(n);});
+    }
+    // names applied as a decorator (@name / @obj.name) anywhere → the decorator fn is genuinely used
+    const decoratorNames=new Set();
+    for(const f of files){
+      if(!ANALYZABLE.has(f.ext))continue;
+      let dm;const dre=/^\s*@\s*([A-Za-z_$][\w$.]*)/gm;
+      while((dm=dre.exec(f.content))){const full=dm[1];
+        decoratorNames.add(full.split('.').pop());if(!full.includes('.'))decoratorNames.add(full);}
+    }
+    // names referenced via dynamic dispatch as a string: getattr(_, 'name') / globals()['name'] / locals()['name']
+    const dynamicRefNames=new Set();
+    for(const f of files){
+      if(!ANALYZABLE.has(f.ext))continue;let gm;
+      const gre=/getattr\s*\(\s*[^,()]+,\s*['"]([A-Za-z_$][\w$]*)['"]|(?:globals|locals)\s*\(\s*\)\s*\[\s*['"]([A-Za-z_$][\w$]*)['"]/g;
+      while((gm=gre.exec(f.content)))dynamicRefNames.add(gm[1]||gm[2]);
+    }
+    // returns the list of LOW-confidence reasons for an unused symbol (empty → HIGH confidence)
+    function lowConfidenceReasons(s,isPyFile){
+      const n=s.name,r=[];
+      if(s.decorated)r.push('decorated');
+      if((isPyFile&&s.exported)||allExports.has(n))r.push('listed in __all__');
+      if(isPyFile&&PY_FRAMEWORK_HOOKS.has(n))r.push('framework hook name');
+      if(HOOK_AFFIX.test(n))r.push('hook naming convention');
+      if(/^__\w+__$/.test(n))r.push('magic method');
+      if(TEST_FIXTURE.test(n))r.push('test fixture');
+      if(dynamicRefNames.has(n))r.push('dynamic dispatch reference');
+      return r;
     }
     for(const s of allSymbols){
+      if(s.kind!=='function')continue;
       const isPyFile=s.file.endsWith('.py');
+      const isMagic=/^__\w+__$/.test(s.name);
+      // single/double leading-underscore (non-dunder) in Python = intentionally private → respected
+      if(isPyFile&&/^_/.test(s.name)&&!isMagic)continue;
       const called=(reverseCall[s.name]||[]).length>0;
-      // a single occurrence is just its own declaration; >1 means referenced elsewhere
-      const referenced=(refCount[s.name]||0)>1;
-      const isCalled=called||referenced;
+      const referenced=(refCount[s.name]||0)>1;          // >1 = referenced in real code elsewhere
+      const usedAsDecorator=decoratorNames.has(s.name);   // applied as @decorator → genuinely used
+      const isCalled=called||referenced||usedAsDecorator;
       const isImported=importedNames.has(s.name);
-      // entry-point names are never "dead"; only treat genuine test files as such
-      // (a directory segment or a .test./.spec. suffix — NOT a file literally named test.js)
+      // entry-point names and genuine test files are never "dead"
       const isTestFile=/(^|\/)(tests?|specs?|__tests__|__mocks__)\//i.test(s.file)
         || /\.(test|spec)\.[a-z]+$/i.test(s.file)
         || /(^|\/)test_\w+\.py$/i.test(s.file)||/_test\.py$/i.test(s.file);
-      // Python conventions: _private = intentionally private (skip), dunder = framework hooks,
-      // names in __all__ are public API (treated as exported)
-      const isPyPrivate=isPyFile&&/^_/.test(s.name);
-      const isPyDunder=isPyFile&&/^__\w+__$/.test(s.name);
-      // _private / dunder = intentional; __all__ members = declared public API;
-      // decorated defs = framework-invoked (Flask/FastAPI routes, fixtures, properties)
-      if(isPyPrivate||isPyDunder)continue;
-      if(isPyFile&&s.exported)continue;     // in __all__ → public API, not dead
-      if(s.decorated)continue;              // route/handler/fixture — invoked by a framework
-      const isEntry=/^(main|index|app|server|setup|init|default|render|handler|module|constructor)$/i.test(s.name)
-        || isTestFile;
-      if(s.kind==='function'){
-        if(s.exported&&!isImported&&!isEntry){
-          deadCode.push({kind:'unused-export',name:s.name,file:s.file,line:s.line,
-            reason:isPyFile?`In __all__ / module-public but never imported across the analyzed set.`
-              :`Exported but never imported anywhere in the analyzed set.`});
-        }else if(!s.exported&&!isCalled&&!isEntry){
-          deadCode.push({kind:'unused-function',name:s.name,file:s.file,line:s.line,
-            reason:`Function is never called within the analyzed files.`});
-        }
+      const isEntryName=/^(main|index|app|server|setup|init|default|render|handler|module|constructor)$/i.test(s.name);
+      // entry points and test files are never "dead" — but keep test fixtures (setUp/tearDown)
+      // so they surface as LOW-confidence rather than being silently hidden.
+      if((isEntryName&&!TEST_FIXTURE.test(s.name))||isTestFile)continue;
+
+      // unused candidate?
+      let baseKind=null;
+      if(s.exported&&!isImported)baseKind='unused-export';
+      else if(!s.exported&&!isCalled)baseKind='unused-function';
+      if(!baseKind)continue;
+
+      const reasons=lowConfidenceReasons(s,isPyFile);
+      if(reasons.length){
+        // LOW confidence — likely a framework hook or dynamic dispatch, not real dead code
+        deadCode.push({kind:'possibly-unused',confidence:'low',name:s.name,file:s.file,line:s.line,
+          signals:reasons,
+          reason:'May be called dynamically or by framework. Verify before removing. ('+reasons.join(', ')+')'});
+      }else{
+        // HIGH confidence — defined and never referenced by name anywhere
+        deadCode.push({kind:baseKind,confidence:'high',name:s.name,file:s.file,line:s.line,
+          reason:baseKind==='unused-export'
+            ?(isPyFile?`In __all__ / module-public but never imported across the analyzed set.`
+                      :`Exported but never imported anywhere in the analyzed set.`)
+            :`Function is never called within the analyzed files.`});
       }
     }
 
@@ -2200,8 +2268,9 @@ const QuickWins = (()=>{
         time:timeLabel(ease,false),title:f.title,file:f.file,line:f.line,
         impactText:impactText(f),before:f.snippet,after:f.fixedCode});
     }
-    // 2) dead code deletions (trivial, safe)
+    // 2) dead code deletions (trivial, safe) — HIGH confidence only; LOW (verify) is not a quick win
     for(const d of State.deadCode){
+      if(d.confidence==='low')continue;
       const sym=State.symbols.find(s=>s.name===d.name&&s.file===d.file);
       const span=sym?(sym.endLine-sym.line+1):1;
       const ease=span<=5?10:span<=20?8:5;
@@ -3492,13 +3561,22 @@ function renderDeadCode(){
   p.append(el('div',{class:'section-title'},'💀 Dead Code'));
   if(!State.deadCode.length){p.append(el('div',{class:'empty'},el('div',{class:'big'},'✓'),
     el('div',{},'No dead code detected.')));return;}
+  const hi=State.deadCode.filter(d=>d.confidence!=='low').length;
+  const lo=State.deadCode.filter(d=>d.confidence==='low').length;
+  p.append(el('div',{class:'dead-counts'},
+    el('span',{class:'dc-hi'},`High confidence: ${hi}`),
+    el('span',{class:'dc-sep'},'|'),
+    el('span',{class:'dc-lo'},`Verify manually: ${lo}`)));
   p.append(el('p',{class:'muted',style:'margin-bottom:12px'},
-    'Exports never imported and functions never called within the analyzed file set. '+
-    'Note: dynamic calls and external consumers can\'t be seen statically.'));
-  for(const d of State.deadCode){
-    const c=el('div',{class:'finding sev-info'},
+    'High confidence = defined and never referenced anywhere (likely safe to delete). '+
+    'Verify manually = may be invoked by a framework or dynamic dispatch — confirm before removing.'));
+  // HIGH confidence first, then LOW (verify) — sorted within the list
+  const ordered=[...State.deadCode].sort((a,b)=>(a.confidence==='low'?1:0)-(b.confidence==='low'?1:0));
+  for(const d of ordered){
+    const low=d.confidence==='low';
+    const c=el('div',{class:'finding '+(low?'sev-med':'sev-info')},
       el('div',{class:'finding-head',onClick:e=>e.currentTarget.parentElement.classList.toggle('open')},
-        el('span',{class:'badge2 b-info'},d.kind),
+        el('span',{class:'badge2 '+(low?'b-med':'b-info')},low?'POSSIBLY-UNUSED':d.kind.toUpperCase()),
         el('span',{class:'finding-title'},d.name),
         el('span',{class:'finding-loc',onClick:e=>{e.stopPropagation();openInFile(d.file,d.line);}},
           basename(d.file)+':'+d.line)),
