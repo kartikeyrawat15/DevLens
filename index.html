@@ -770,6 +770,8 @@ const Fingerprint = {
 
     ctx.frameworks=[...ctx.frameworks];ctx.auth=[...ctx.auth];
     ctx.db=[...ctx.db];ctx.apiStyle=[...ctx.apiStyle];
+    // project-wide CSRF signals (routes & session middleware can live in different files)
+    ctx.csrf=PatternEngine.csrfSignals(files);
     return ctx;
   }
 };
@@ -1181,28 +1183,44 @@ const PatternEngine = (()=>{
       poc,learn:'https://cwe.mitre.org/data/definitions/352.html',
     };
   }
-  function scanCsrf(file){
+  // Strip JS comments so commented-out code (e.g. NodeGoat's `// app.use(csrf())`
+  // or "Enable csurf module" notes) is NOT mistaken for active protection.
+  function stripJsComments(src){
+    return src.replace(/\/\*[\s\S]*?\*\//g,' ')          // block comments
+              .replace(/(^|[^:'"`])\/\/.*$/gm,'$1');      // line comments (keep http://)
+  }
+  const STATE_ROUTE=/\b(?:app|router)\s*\.\s*(post|put|delete|patch)\s*\(/i;
+  const SESSION_MW=/app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{|express-session|cookie-session/;
+  // Active (not commented) CSRF protection: middleware applied or token plumbing present.
+  const CSRF_ACTIVE=/app\.use\s*\(\s*(?:csrf|csurf)\b|app\.use\s*\(\s*lusca\.csrf|lusca\s*\(\s*\{[^}]*csrf|\bcsrfProtection\b|req\.csrfToken\s*\(|\bcsrfToken\b|name\s*=\s*['"]_csrf['"]|\b_csrf\b|authenticity_token|\bxsrf\b|XSRF-TOKEN/i;
+
+  // Project-wide CSRF signals across the whole file set (routes & session middleware
+  // often live in different files — e.g. NodeGoat's server.js vs app/routes/*).
+  function csrfSignals(files){
+    let protectedFlag=false,hasStateRoute=false,hasSession=false;
+    for(const f of files){
+      if(!ANALYZABLE.has(f.ext)||famOf(f.ext)!=='js')continue;
+      const s=stripJsComments(f.content);
+      if(CSRF_ACTIVE.test(s))protectedFlag=true;
+      if(STATE_ROUTE.test(s))hasStateRoute=true;
+      if(SESSION_MW.test(s))hasSession=true;
+    }
+    return {protected:protectedFlag,hasStateRoute,hasSession};
+  }
+
+  function scanCsrf(file,proj){
     const out=[];
     if(famOf(file.ext)!=='js')return out;
     const lines=file.content.split('\n');
-    const src=file.content;
-    // CSRF protection present anywhere? Match real middleware / token plumbing,
-    // not the bare word "csrf" in a comment.
-    const hasCsrf=/\b(csurf|lusca|csrfProtection)\b/.test(src)
-      ||/require\(\s*['"](csurf|csrf|lusca)['"]\s*\)/.test(src)
-      ||/(helmet|lusca)\s*\.\s*csrf/.test(src)
-      ||/\bcsrfToken\b|_csrf\b|authenticity_token|\bxsrf\b|XSRF-TOKEN/i.test(src);
-
-    // 1) Express state-changing routes + session middleware, but no CSRF
-    const stateRouteRe=/\b(?:app|router)\s*\.\s*(post|put|delete|patch)\s*\(/i;
-    const sessionRe=/\b(?:express-session|cookie-session)\b|app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{/;
-    if(!hasCsrf&&stateRouteRe.test(src)&&sessionRe.test(src)){
-      let ln=lines.findIndex(l=>/app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{/.test(l));
-      if(ln<0)ln=lines.findIndex(l=>/express-session|cookie-session/.test(l));
-      if(ln<0)ln=lines.findIndex(l=>stateRouteRe.test(l));
+    const stripped=stripJsComments(file.content);
+    // 1) This file registers session middleware; the project has state-changing
+    //    routes (possibly in another file) and NO active CSRF protection anywhere.
+    if(proj&&!proj.protected&&proj.hasStateRoute&&SESSION_MW.test(stripped)){
+      let ln=lines.findIndex(l=>/app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{/.test(l)&&!isComment(l));
+      if(ln<0)ln=lines.findIndex(l=>/express-session|cookie-session/.test(l)&&!isComment(l));
       if(ln<0)ln=0;
       out.push(csrfFinding(file,ln+1,lines[ln].trim(),
-        'This Express app registers session middleware and state-changing routes (POST/PUT/DELETE) but no CSRF protection (csurf, lusca, helmet.csrf). A malicious site can forge authenticated requests using the victim\'s session cookie.',
+        'This Express app registers session middleware and the codebase has state-changing routes (POST/PUT/DELETE) but no active CSRF protection (csurf, lusca, helmet.csrf). A malicious site can forge authenticated requests using the victim\'s session cookie. Note: routes are often defined in a separate file, and commented-out CSRF setup does not count as protection.',
         'Host a page that auto-submits a form to a state-changing route; the browser attaches the session cookie and the action executes without the user\'s intent.'));
     }
     // 2) Form submissions without a hidden CSRF token field (template markup in this file)
@@ -1224,13 +1242,125 @@ const PatternEngine = (()=>{
 
   function run(files,ctx){
     let findings=[];
+    // Prefer project-wide CSRF signals computed at fingerprint time (the pipeline
+    // calls run() one file at a time); otherwise compute from the files we got.
+    const proj=(ctx&&ctx.csrf)?ctx.csrf:csrfSignals(files);
     for(const f of files){
       if(!ANALYZABLE.has(f.ext))continue;
-      findings=findings.concat(scanLines(f),scanStructural(f),scanCsrf(f));
+      findings=findings.concat(scanLines(f),scanStructural(f),scanCsrf(f,proj));
     }
     return findings;
   }
-  return {run,RULES};
+  return {run,RULES,csrfSignals};
+})();
+
+/* ════════════════════════════════════════════════════════════════════════
+   DEPENDENCY SCANNER — OSV.dev vulnerability lookup on package.json deps
+   Queries https://api.osv.dev (free, no key) for known CVEs/GHSAs affecting
+   the resolved versions. Network failures degrade gracefully (skipped).
+   ════════════════════════════════════════════════════════════════════════ */
+const DepScanner = (()=>{
+  const OSV_BATCH='https://api.osv.dev/v1/querybatch';
+  const OSV_VULN='https://api.osv.dev/v1/vulns/';
+
+  // Reduce a semver range ("^4.16.0", ">=1.2.3 <2", "~0.3.5") to one concrete version.
+  function cleanVersion(spec){
+    if(typeof spec!=='string')return null;
+    spec=spec.trim();
+    if(/^(?:\*|x|latest|next|workspace:|link:|file:|git\+|github:|npm:|https?:)/i.test(spec))return null;
+    if(spec.includes('/')&&!spec.startsWith('@'))return null; // "owner/repo" shorthand
+    const m=spec.match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/);
+    return m?m[0]:null;
+  }
+
+  function parseDeps(pkgFile){
+    let pkg;try{pkg=JSON.parse(pkgFile.content);}catch{return [];}
+    const lines=pkgFile.content.split('\n');
+    const out=[];
+    for(const field of ['dependencies','devDependencies','optionalDependencies']){
+      const obj=pkg[field];if(!obj||typeof obj!=='object')continue;
+      for(const[name,spec]of Object.entries(obj)){
+        const version=cleanVersion(spec);
+        if(!version)continue;
+        const re=new RegExp('"'+name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'"\\s*:');
+        const idx=lines.findIndex(l=>re.test(l));
+        out.push({name,version,spec,line:idx>=0?idx+1:1,dev:field!=='dependencies'});
+      }
+    }
+    return out;
+  }
+
+  function severityFromVuln(v){
+    const ds=(v.database_specific&&v.database_specific.severity)||'';
+    const map={CRITICAL:9,HIGH:8,MODERATE:6,MEDIUM:6,LOW:3};
+    if(map[String(ds).toUpperCase()])return map[String(ds).toUpperCase()];
+    // CVSS v3 base score from the vector string, if present
+    const vec=(v.severity&&v.severity[0]&&v.severity[0].score)||'';
+    const sm=/^\d+(\.\d+)?$/.test(vec)?parseFloat(vec):null;
+    if(sm!=null)return sm>=9?9:sm>=7?8:sm>=4?6:3;
+    return 7; // unknown → treat as HIGH
+  }
+
+  function fixedVersion(v){
+    try{
+      for(const a of v.affected||[])
+        for(const r of a.ranges||[])
+          for(const e of r.events||[]) if(e.fixed) return e.fixed;
+    }catch{}
+    return null;
+  }
+
+  async function run(files){
+    const pkg=files.find(f=>basename(f.path)==='package.json');
+    if(!pkg)return {findings:[],scanned:0,note:'no package.json'};
+    const deps=parseDeps(pkg);
+    if(!deps.length)return {findings:[],scanned:0,note:'no resolvable versions'};
+
+    let results;
+    try{
+      const resp=await fetch(OSV_BATCH,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({queries:deps.map(d=>({package:{ecosystem:'npm',name:d.name},version:d.version}))})});
+      if(!resp.ok)throw new Error('OSV HTTP '+resp.status);
+      results=(await resp.json()).results||[];
+    }catch(e){ return {findings:[],scanned:deps.length,error:e.message}; }
+
+    // fetch details for unique advisory ids (capped) to get severity + fix versions
+    const idSet=new Set();
+    results.forEach(r=>((r&&r.vulns)||[]).forEach(v=>idSet.add(v.id)));
+    const detailIds=[...idSet].slice(0,60);
+    const details={};
+    await Promise.all(detailIds.map(async id=>{
+      try{const r=await fetch(OSV_VULN+id);if(r.ok)details[id]=await r.json();}catch{}
+    }));
+
+    const findings=[];
+    deps.forEach((d,i)=>{
+      const vulns=(results[i]&&results[i].vulns)||[];
+      if(!vulns.length)return;
+      const ids=vulns.map(v=>v.id);
+      const detailed=ids.map(id=>details[id]).filter(Boolean);
+      const sev=Math.max(7,...(detailed.length?detailed.map(severityFromVuln):[7]));
+      const fixes=[...new Set(detailed.map(fixedVersion).filter(Boolean))];
+      const cweIds=detailed.flatMap(v=>(v.database_specific&&v.database_specific.cwe_ids)||[]);
+      const summaries=(detailed.length?detailed:vulns).map(v=>`${v.id}: ${v.summary||(v.aliases||[]).join(', ')||'advisory'}`).slice(0,5);
+      findings.push({
+        id:uid('f'),source:'deps',category:'security',ruleId:'dep-vuln',
+        title:`Vulnerable dependency: ${d.name}@${d.version} (${ids.length} advisor${ids.length>1?'ies':'y'})`,
+        severity:sev,confidence:100,
+        cwe:cweIds[0]||null,cvss:null,
+        file:pkg.path,line:d.line,endLine:d.line,
+        snippet:`"${d.name}": "${d.spec}"`,
+        description:`${d.name}@${d.version} (${d.dev?'devDependency':'dependency'}) has known vulnerabilities reported by OSV.dev:\n`+
+          summaries.join('\n')+(fixes.length?`\n\nFixed in: ${fixes.sort().join(', ')}`:''),
+        fixedCode:fixes.length?`// Upgrade ${d.name} to ${fixes.sort().slice(-1)[0]} or later`:`// Upgrade ${d.name} to a non-vulnerable version (see advisory)`,
+        poc:null,
+        learn:'https://osv.dev/list?ecosystem=npm&q='+encodeURIComponent(d.name),
+        advisories:ids,
+      });
+    });
+    return {findings,scanned:deps.length,vulnerable:findings.length};
+  }
+  return {run,parseDeps,cleanVersion};
 })();
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -3161,6 +3291,7 @@ const STEPS=[
   {k:'taint',label:'Tracing data flows'},
   {k:'auth',label:'Checking auth coverage'},
   {k:'patterns',label:'Running pattern engine'},
+  {k:'deps',label:'Scanning dependencies (OSV.dev)'},
   {k:'ai',label:'AI deep analysis — logic bugs'},
   {k:'correlate',label:'Correlating findings & generating fixes'},
 ];
@@ -3257,9 +3388,21 @@ async function runAnalysis(allFiles){
   const structFindings=ASTEngine.structuralFindings(State.symbols);
   setStep('patterns','done',(patternFindings.length+structFindings.length)+' pattern hits');
 
+  // STEP 5b — dependency vulnerabilities (OSV.dev lookup on package.json)
+  setStep('deps','active');await tick();
+  let depFindings=[];
+  try{
+    const dep=await DepScanner.run(files);
+    depFindings=dep.findings||[];
+    setStep('deps','done',
+      dep.error?('skipped: '+String(dep.error).slice(0,30))
+      :dep.note?dep.note
+      :`${dep.vulnerable||0} vulnerable / ${dep.scanned} deps`);
+  }catch(e){ setStep('deps','done','skipped: '+e.message.slice(0,30)); }
+
   // assemble static findings
   let staticFindings=[
-    ...patternFindings,...structFindings,
+    ...patternFindings,...structFindings,...depFindings,
     ...DataFlowEngine.toFindings(State.taintFlows),
     ...AuthMapper.toFindings(State.routes),
   ];

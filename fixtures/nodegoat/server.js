@@ -1,38 +1,36 @@
-// NodeGoat-style Express bootstrap — exercises sec-csrf-missing.
-// Session middleware + state-changing routes, but NO csrf middleware.
-const express = require("express");
-const session = require("express-session");
-const bodyParser = require("body-parser");
+// NodeGoat-style Express bootstrap (faithful to OWASP/NodeGoat architecture).
+// Session middleware lives HERE; the POST/PUT/DELETE routes live in app/routes/.
+// CSRF setup is present only as commented-out code — i.e. NOT active protection.
+"use strict";
 
-const app = express();
+var express = require("express");
+var favicon = require("serve-favicon");
+var bodyParser = require("body-parser");
+var session = require("express-session");
+var http = require("http");
+
+var app = express();
+var routes = require("./app/routes");
 
 app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+
 app.use(session({
-  secret: "keyboard cat",
-  resave: false,
-  saveUninitialized: true
+    secret: "session_cookie_secret",
+    saveUninitialized: true,
+    resave: true
 }));
 
-app.get("/", (req, res) => res.render("index"));
+// Fix for A8 - CSRF
+// Enable Express csurf module
+// Important: this needs to stay after the session and bodyParser middlewares
+// app.use(csrf());
+// app.use(function(req, res, next) {
+//     res.locals.csrftoken = req.csrfToken();
+//     next();
+// });
 
-// State-changing routes with no CSRF token validation:
-app.post("/login", (req, res) => {
-  // authenticate...
-  res.redirect("/dashboard");
-});
+// Register all application routes (defines the app.post / app.put handlers)
+routes(app, {});
 
-app.post("/profile", (req, res) => {
-  // persist profile changes from req.body
-  res.redirect("/profile");
-});
-
-app.put("/allocations/:userId", (req, res) => {
-  // update allocations
-  res.json({ ok: true });
-});
-
-app.delete("/memos/:id", (req, res) => {
-  res.json({ ok: true });
-});
-
-app.listen(4000);
+http.createServer(app).listen(4000);
