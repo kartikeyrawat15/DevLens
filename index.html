@@ -681,6 +681,9 @@ const LANG_BY_EXT={
 };
 const ANALYZABLE=new Set(['js','mjs','cjs','jsx','ts','tsx','py','rb','php','java','go','vue','svelte']);
 const JSFAMILY=new Set(['js','mjs','cjs','jsx','ts','tsx','vue','svelte']);
+// Dependency manifests: small, always critical for dep scanning — never dropped by the file cap.
+const ALWAYS_INCLUDE=new Set(['package.json','requirements.txt','Pipfile','go.mod','Cargo.toml','pom.xml','build.gradle']);
+const isManifest=path=>ALWAYS_INCLUDE.has(basename(path));
 
 /* ───────────────────────── Global application state ───────────────────────── */
 const State = {
@@ -3326,6 +3329,9 @@ async function runAnalysis(allFiles){
   const LIMIT=30;let files=allFiles;let prioritized=false;
   if(allFiles.length>LIMIT){
     files=Input.prioritize([...allFiles]).slice(0,LIMIT);
+    // dependency manifests are tiny but critical — include them even if the cap dropped them
+    const have=new Set(files.map(f=>f.path));
+    for(const f of allFiles){if(isManifest(f.path)&&!have.has(f.path)){files.push(f);have.add(f.path);}}
     prioritized=true;
   }
   State.files=files;
