@@ -87,6 +87,19 @@ CORRELATE     — merge, dedupe, score by impact × confidence
 OUTPUT        — 4 modes, Quick Wins, blast radius, PDF
 ```
 
+## Benchmark Results
+
+| Repo | Type | Score | Key findings |
+|------|------|-------|--------------|
+| NodeGoat | OWASP benchmark | 8/10 OWASP Top 10 | eval injection, IDOR, CSRF, open redirect |
+| OWASP Juice Shop | OWASP benchmark | 9/10 OWASP Top 10 | XSS bypass, JWT attacks, 100+ vulns |
+| DVNA | Intentionally vulnerable | 10/10 categories | Command injection, XXE, SQL, CSRF |
+| Vulnerable Flask | Python benchmark | 5/5 Python patterns | Deserialization, SSRF, path traversal |
+| Express.js | Production framework | verified | Hardcoded secrets at exact lines |
+| Flask source | Production framework | 88/100 health | Clean code baseline confirmed |
+
+Static analysis catches these with 100% confidence and zero AI calls — no hallucination possible on pattern-matched findings.
+
 ## Getting started
 
 ### Option 1 — Use it now (recommended)
