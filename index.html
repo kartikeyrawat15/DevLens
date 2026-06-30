@@ -915,6 +915,27 @@ const PatternEngine = (()=>{
      fix:l=>l.replace(/rejectUnauthorized\s*:\s*false/,'rejectUnauthorized: true'),
      learn:'https://cwe.mitre.org/data/definitions/295.html'},
 
+    {id:'sec-open-redirect',cat:'security',sev:8,cwe:'CWE-601',cvss:6.1,
+     title:'Open redirect — user controls redirect destination',
+     test:l=>{
+       if(isComment(l))return false;
+       // Server-side: res.redirect(...) fed directly from req.body/query/params/headers/cookies
+       if(/\b(?:res|response)\s*\.\s*redirect\s*\(/.test(l)
+          &&/req\.(body|query|params|headers|cookies)\b/.test(l))return true;
+       // Client-side: window.location / location.href / location.assign|replace set from non-literal input
+       const sink=/\b(?:window\.location(?:\.href)?|location\.href|location\.assign|location\.replace)\b/;
+       if(sink.test(l)){
+         const rhs=(l.split(/=|\(/).slice(1).join('=')||'');
+         const literalOnly=/^\s*['"`][^'"`]*['"`]\s*\)?\s*;?\s*$/.test(rhs);
+         if(!literalOnly&&/[A-Za-z_$]/.test(rhs.replace(/['"`][^'"`]*['"`]/g,'')))return true;
+       }
+       return false;
+     },
+     desc:'A redirect destination is taken from user input without validation. An attacker can craft a link to your trusted site that bounces the victim to a malicious page (phishing, token/credential theft).',
+     fix:l=>'// Validate against an allow-list, or only permit relative same-site paths:\n// const safe = new Set(["/home","/dashboard"]); res.redirect(safe.has(target)?target:"/");',
+     poc:'Send a victim /login?next=https://evil.example/phish — after trusting your domain they land on the attacker\'s site.',
+     learn:'https://cwe.mitre.org/data/definitions/601.html'},
+
     /* ───────── PYTHON SECURITY (langs: py) ───────── */
     {id:'py-sql-fstring',cat:'security',sev:9,cwe:'CWE-89',cvss:9.8,langs:['py'],
      title:'SQL injection via f-string / % formatting in execute()',
@@ -1148,11 +1169,64 @@ const PatternEngine = (()=>{
     return out;
   }
 
+  /* file-level CSRF check (needs whole-file view: routes + middleware presence) */
+  function csrfFinding(file,line,snippet,desc,poc){
+    return {
+      id:uid('f'),source:'pattern',category:'security',ruleId:'sec-csrf-missing',
+      title:'No CSRF protection detected',severity:8,confidence:100,
+      cwe:'CWE-352',cvss:8.8,
+      file:file.path,line,endLine:line,snippet,
+      description:desc,
+      fixedCode:'// Add CSRF middleware and emit a token into forms:\n// const csrf = require("csurf");\n// app.use(csrf());  // after session + body parser\n// <input type="hidden" name="_csrf" value="{{csrfToken}}">',
+      poc,learn:'https://cwe.mitre.org/data/definitions/352.html',
+    };
+  }
+  function scanCsrf(file){
+    const out=[];
+    if(famOf(file.ext)!=='js')return out;
+    const lines=file.content.split('\n');
+    const src=file.content;
+    // CSRF protection present anywhere? Match real middleware / token plumbing,
+    // not the bare word "csrf" in a comment.
+    const hasCsrf=/\b(csurf|lusca|csrfProtection)\b/.test(src)
+      ||/require\(\s*['"](csurf|csrf|lusca)['"]\s*\)/.test(src)
+      ||/(helmet|lusca)\s*\.\s*csrf/.test(src)
+      ||/\bcsrfToken\b|_csrf\b|authenticity_token|\bxsrf\b|XSRF-TOKEN/i.test(src);
+
+    // 1) Express state-changing routes + session middleware, but no CSRF
+    const stateRouteRe=/\b(?:app|router)\s*\.\s*(post|put|delete|patch)\s*\(/i;
+    const sessionRe=/\b(?:express-session|cookie-session)\b|app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{/;
+    if(!hasCsrf&&stateRouteRe.test(src)&&sessionRe.test(src)){
+      let ln=lines.findIndex(l=>/app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{/.test(l));
+      if(ln<0)ln=lines.findIndex(l=>/express-session|cookie-session/.test(l));
+      if(ln<0)ln=lines.findIndex(l=>stateRouteRe.test(l));
+      if(ln<0)ln=0;
+      out.push(csrfFinding(file,ln+1,lines[ln].trim(),
+        'This Express app registers session middleware and state-changing routes (POST/PUT/DELETE) but no CSRF protection (csurf, lusca, helmet.csrf). A malicious site can forge authenticated requests using the victim\'s session cookie.',
+        'Host a page that auto-submits a form to a state-changing route; the browser attaches the session cookie and the action executes without the user\'s intent.'));
+    }
+    // 2) Form submissions without a hidden CSRF token field (template markup in this file)
+    for(let i=0;i<lines.length;i++){
+      if(!/<form\b/i.test(lines[i]))continue;
+      if(!/method\s*=\s*['"]?\s*(post|put|delete|patch)/i.test(lines[i]))continue;
+      // collect the form block to its closing tag (best-effort, capped)
+      let block=lines[i];
+      for(let j=i+1;j<lines.length&&j<i+60;j++){block+='\n'+lines[j];if(/<\/form>/i.test(lines[j]))break;}
+      const hasToken=/_?csrf|authenticity_token|xsrf/i.test(block);
+      if(!hasToken){
+        out.push(csrfFinding(file,i+1,lines[i].trim(),
+          'A form submits with a state-changing method but contains no hidden CSRF token field. Without an unpredictable token the form can be submitted cross-site on the victim\'s behalf.',
+          'Auto-submit a copy of this form from an attacker page; lacking a per-session token, the server cannot tell the request is forged.'));
+      }
+    }
+    return out;
+  }
+
   function run(files,ctx){
     let findings=[];
     for(const f of files){
       if(!ANALYZABLE.has(f.ext))continue;
-      findings=findings.concat(scanLines(f),scanStructural(f));
+      findings=findings.concat(scanLines(f),scanStructural(f),scanCsrf(f));
     }
     return findings;
   }
@@ -2359,6 +2433,8 @@ const QuickWins = (()=>{
       'sec-sql-concat':'Prevents database compromise via SQL injection','sec-jwt-decode':'Prevents auth bypass via forged tokens',
       'py-sql-fstring':'Prevents database compromise via SQL injection','py-shell-true':'Prevents OS command injection',
       'py-secret-key':'Prevents session/cookie forgery','sec-http-url':'Stops cleartext data interception',
+      'sec-csrf-missing':'Blocks cross-site request forgery on state-changing routes',
+      'sec-open-redirect':'Stops attacker-controlled redirects used for phishing',
       'auth-missing':'Closes unauthenticated access to this endpoint'}[f.ruleId];
     return specific||base||f.description.slice(0,80);
   }
