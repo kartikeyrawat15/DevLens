@@ -111,6 +111,9 @@ code,pre,.mono{font-family:var(--mono)}
 .tree-item .cnt{font-size:10px;color:var(--fg3);background:var(--bg);padding:0 5px;border-radius:8px}
 .tree-item .sev-pip{font-size:9px;font-weight:700;width:14px;height:14px;border-radius:3px;
   display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.tree-item .tbadge{font-size:9px;font-weight:700;width:14px;height:14px;border-radius:3px;
+  display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
+  background:var(--gray);color:var(--bg)}
 .cv-line.flagged{background:rgba(218,170,63,.08)}
 
 /* ---------- Quick Wins ---------- */
@@ -684,6 +687,14 @@ const JSFAMILY=new Set(['js','mjs','cjs','jsx','ts','tsx','vue','svelte']);
 // Dependency manifests: small, always critical for dep scanning — never dropped by the file cap.
 const ALWAYS_INCLUDE=new Set(['package.json','requirements.txt','Pipfile','go.mod','Cargo.toml','pom.xml','build.gradle']);
 const isManifest=path=>ALWAYS_INCLUDE.has(basename(path));
+// Test/spec files: fixture credentials, localhost URLs and redirect tests are expected,
+// so a subset of security rules is skipped for them (see PatternEngine `skipInTests`).
+const isTestFile=path=>{
+  const p=String(path||'');
+  return /(^|\/)(__tests__|tests?|e2e|__mocks__|cypress)\//i.test(p)            // __tests__/, test/, tests/, e2e/…
+    || /\.(test|spec)\.[mc]?[jt]sx?$/i.test(p)                                  // *.test.ts/js, *.spec.ts/js
+    || /\.(unit|e2e|integration|int|component)\.test\.[mc]?[jt]sx?$/i.test(p);  // *.unit.test.*, *.e2e.test.*
+};
 
 /* ───────────────────────── Global application state ───────────────────────── */
 const State = {
@@ -863,7 +874,7 @@ const PatternEngine = (()=>{
      fix:l=>'// Build nodes with createElement + textContent instead of document.write.',
      learn:'https://cwe.mitre.org/data/definitions/79.html'},
 
-    {id:'sec-hardcoded-secret',cat:'security',sev:8,cwe:'CWE-798',cvss:7.5,
+    {id:'sec-hardcoded-secret',cat:'security',sev:8,cwe:'CWE-798',cvss:7.5,skipInTests:true,
      title:'Hardcoded credential / secret',
      test:l=>{ if(isComment(l))return false;
        return /(password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|private[_-]?key|client[_-]?secret)\s*[:=]\s*['"][^'"\s]{6,}['"]/i.test(l)
@@ -874,7 +885,7 @@ const PatternEngine = (()=>{
      poc:'Grep the repository / built bundle for the literal; the credential is directly usable.',
      learn:'https://cwe.mitre.org/data/definitions/798.html'},
 
-    {id:'sec-http-url',cat:'security',sev:4,cwe:'CWE-319',cvss:5.9,
+    {id:'sec-http-url',cat:'security',sev:4,cwe:'CWE-319',cvss:5.9,skipInTests:true,
      title:'Hardcoded http:// (cleartext) URL',
      test:l=>{if(isComment(l))return false;
        return /['"]http:\/\/(?!localhost|127\.0\.0\.1|0\.0\.0\.0)[^'"]+['"]/.test(l);},
@@ -920,7 +931,7 @@ const PatternEngine = (()=>{
      fix:l=>l.replace(/rejectUnauthorized\s*:\s*false/,'rejectUnauthorized: true'),
      learn:'https://cwe.mitre.org/data/definitions/295.html'},
 
-    {id:'sec-open-redirect',cat:'security',sev:8,cwe:'CWE-601',cvss:6.1,
+    {id:'sec-open-redirect',cat:'security',sev:8,cwe:'CWE-601',cvss:6.1,skipInTests:true,
      title:'Open redirect — user controls redirect destination',
      test:l=>{
        if(isComment(l))return false;
@@ -940,6 +951,111 @@ const PatternEngine = (()=>{
      fix:l=>'// Validate against an allow-list, or only permit relative same-site paths:\n// const safe = new Set(["/home","/dashboard"]); res.redirect(safe.has(target)?target:"/");',
      poc:'Send a victim /login?next=https://evil.example/phish — after trusting your domain they land on the attacker\'s site.',
      learn:'https://cwe.mitre.org/data/definitions/601.html'},
+
+    /* ───────── XSS (reflected / stored / jQuery) ───────── */
+    {id:'sec-xss-reflected',cat:'security',sev:7,cwe:'CWE-79',cvss:6.1,
+     title:'Reflected XSS — user input written to response',
+     test:l=>{
+       if(isComment(l))return false;
+       const arg=(l.split(/\bres(?:ponse)?\s*\.\s*(?:send|write|end)\s*\(/)[1]||'');
+       // res.send/write/end(...) containing raw req.* (and not JSON/sanitized helpers)
+       if(/\bres(?:ponse)?\s*\.\s*(send|write|end)\s*\(/.test(l)
+          &&/req\.(query|params|body|headers|cookies)\b/.test(arg)
+          &&!/(escape|sanitize|encodeURI|DOMPurify|xss\()/i.test(arg))return true;
+       // res.json/res.send with user input concatenated into a string
+       if(/\bres(?:ponse)?\s*\.\s*(send|json)\s*\(/.test(l)
+          &&/['"`][^'"`]*['"`]\s*\+\s*req\.|req\.(query|params|body)\b[^)]*\+\s*['"`]/.test(l))return true;
+       return false;
+     },
+     desc:'User-controlled input is written into the HTTP response without encoding. If it reaches an HTML context the attacker can inject script (reflected XSS).',
+     fix:l=>'// Encode for the output context (HTML-escape), or return JSON with a correct content-type:\n// res.send(escapeHtml(value));  // or res.json({ value })',
+     poc:'Request the route with `?q=<script>alert(document.cookie)<\/script>`; the script executes in the victim\'s browser.',
+     learn:'https://cwe.mitre.org/data/definitions/79.html'},
+
+    {id:'sec-xss-jquery',cat:'security',sev:7,cwe:'CWE-79',cvss:6.1,
+     title:'jQuery .html() with dynamic content (XSS)',
+     test:l=>{
+       if(isComment(l))return false;
+       if(!/\.html\s*\(/.test(l))return false;
+       if(!/\$\(|\bjQuery\b|\$\w/.test(l))return false;          // jQuery context on the line
+       const arg=(l.split(/\.html\s*\(/)[1]||'');
+       if(/^\s*\)/.test(arg))return false;                       // .html() getter, no arg
+       return /[A-Za-z_$]/.test(arg.replace(/['"`][^'"`]*['"`]/g,''));  // arg has a variable
+     },
+     desc:'jQuery .html() parses and inserts its argument as HTML. Passing a variable (especially user- or DB-derived) enables XSS.',
+     fix:l=>l.replace(/\.html\s*\(/,'.text('),
+     poc:'If the value contains `<img src=x onerror=alert(1)>`, jQuery inserts it as live markup and the handler fires.',
+     learn:'https://cwe.mitre.org/data/definitions/79.html'},
+
+    {id:'sec-xss-render',cat:'security',sev:6,cwe:'CWE-79',cvss:6.1,
+     title:'Unsanitized user input passed to template (stored/reflected XSS)',
+     test:l=>{
+       if(isComment(l))return false;
+       return /\bres(?:ponse)?\s*\.\s*render\s*\(/.test(l)
+         &&/req\.(query|params|body|cookies)\b/.test(l)
+         &&!/(escape|sanitize|DOMPurify|xss\()/i.test(l);
+     },
+     desc:'User input is passed straight into template locals. In a non-auto-escaping template engine (or a triple-mustache / unescaped tag) this renders as HTML and enables XSS.',
+     fix:l=>'// Sanitize before rendering, and ensure the template auto-escapes the variable:\n// res.render("view", { name: escapeHtml(req.query.name) });',
+     poc:'Submit `<script>…<\/script>` as the input; if the template emits it unescaped, it executes.',
+     learn:'https://cwe.mitre.org/data/definitions/79.html'},
+
+    /* ───────── ANGULAR XSS (langs gated to .ts/.tsx — Juice Shop) ───────── */
+    {id:'sec-ng-bypass',cat:'security',sev:8,cwe:'CWE-79',cvss:7.4,exts:['ts','tsx'],
+     title:'Angular DomSanitizer bypass disables XSS protection',
+     test:l=>/bypassSecurityTrust(Html|Script|Style|Url|ResourceUrl)\s*\(/.test(l)&&!isComment(l),
+     desc:'bypassSecurityTrust* explicitly tells Angular to trust a value and skip its built-in sanitization. If the value is user-influenced this reintroduces XSS (or script/URL injection).',
+     fix:l=>'// Avoid bypassing the sanitizer. Bind plain text/interpolation, or sanitize:\n// this.sanitizer.sanitize(SecurityContext.HTML, value)',
+     poc:'Feed a value containing `<img src=x onerror=…>` (or `javascript:` for URLs); Angular renders it without sanitizing.',
+     learn:'https://angular.io/guide/security#bypass-security-apis'},
+
+    {id:'sec-ng-innerhtml',cat:'security',sev:7,cwe:'CWE-79',cvss:6.1,exts:['ts','tsx'],
+     title:'Angular [innerHTML] binding (potential XSS)',
+     test:l=>/\[innerHTML\]\s*=\s*["'][^"']*[A-Za-z_$][^"']*["']/.test(l)&&!isComment(l),
+     desc:'An [innerHTML] binding renders its expression as HTML. Angular sanitizes it, but combined with a DomSanitizer bypass or a permissive value it is a common XSS sink — prefer text interpolation.',
+     fix:l=>'// Prefer interpolation {{ value }}; if HTML is required, sanitize explicitly and never bypass.',
+     learn:'https://angular.io/guide/security#sanitization-and-security-contexts'},
+
+    /* ───────── JWT algorithm confusion (js/ts) ───────── */
+    {id:'sec-jwt-no-alg',cat:'security',sev:7,cwe:'CWE-347',cvss:7.5,
+     title:'jwt.verify() without an explicit algorithms allow-list',
+     test:l=>{
+       if(isComment(l))return false;
+       // explicitly accepting the "none" algorithm is always wrong
+       if(/algorithms?\s*:\s*\[?\s*['"]none['"]/i.test(l))return true;
+       if(!/jwt\s*\.\s*verify\s*\(/.test(l))return false;
+       if(/algorithms?\s*:/.test(l))return false;                 // allow-list present on this line
+       const after=(l.split(/jwt\s*\.\s*verify\s*\(/)[1]||'');
+       if(/\{/.test(after))return false;                          // options object opened (algs may be on later lines)
+       return true;                                               // verify(token, secret[, cb]) with no options at all
+     },
+     desc:'jwt.verify() without an `algorithms` allow-list lets an attacker choose the algorithm — including `none` (unsigned) or swapping RS256→HS256 to sign tokens with the public key. Always pin the expected algorithm(s).',
+     fix:l=>l.replace(/jwt\s*\.\s*verify\s*\(([^)]*)\)/,'jwt.verify($1, { algorithms: ["HS256"] })'),
+     poc:'Forge a token with header {"alg":"none"} (or HS256 signed with the RSA public key); a verify() with no allow-list accepts it.',
+     learn:'https://cwe.mitre.org/data/definitions/347.html'},
+
+    /* ───────── PROTOTYPE POLLUTION (js/ts) ───────── */
+    {id:'sec-proto-pollution',cat:'security',sev:7,cwe:'CWE-1321',cvss:7.3,
+     title:'Prototype pollution via unsafe merge/assign of user input',
+     test:l=>{
+       if(isComment(l))return false;
+       const hasUser=/req\.(body|query|params)\b|userInput|payload|\.body\b|JSON\.parse\s*\(/.test(l);
+       // recursive merge / deep set of user input (lodash, deepmerge, $.extend(true,…))
+       if(/\b(_\.)?(merge|mergeWith|defaultsDeep|set|setWith)\s*\(/.test(l)&&hasUser)return true;
+       if(/\bdeepmerge\s*\(/.test(l)&&hasUser)return true;
+       if(/\$\.extend\s*\(\s*true\b/.test(l))return true;
+       // Object.assign(target, userInput)  /  spread of parsed user input
+       if(/Object\.assign\s*\(/.test(l)&&hasUser)return true;
+       if(/\{\s*\.\.\.\s*(JSON\.parse\s*\(|req\.(body|query|params)|userInput|payload)/.test(l))return true;
+       // for (key in userInput) target[key] = userInput[key]  — without a hasOwnProperty / __proto__ guard
+       if(/\bfor\s*\(\s*(?:const|let|var)\s+\w+\s+in\s+(req\.|.*userInput|.*payload|.*\.body)/.test(l)
+          &&!/hasOwnProperty|__proto__|prototype/.test(l))return true;
+       return false;
+     },
+     desc:'Merging/assigning attacker-controlled keys into an object without filtering can set `__proto__`/`constructor.prototype`, polluting Object.prototype globally — leading to DoS, property injection, or RCE downstream.',
+     fix:l=>'// Reject dangerous keys, or use a null-prototype target / Map / structuredClone:\n// if (["__proto__","constructor","prototype"].includes(key)) continue;',
+     poc:'POST `{"__proto__":{"isAdmin":true}}`; after the merge every object reports isAdmin=true.',
+     learn:'https://cwe.mitre.org/data/definitions/1321.html'},
 
     /* ───────── PYTHON SECURITY (langs: py) ───────── */
     {id:'py-sql-fstring',cat:'security',sev:9,cwe:'CWE-89',cvss:9.8,langs:['py'],
@@ -1100,14 +1216,16 @@ const PatternEngine = (()=>{
   // language family + rule applicability gate
   const UNIVERSAL_RULES=new Set(['q-todo','q-debugger']);
   function famOf(ext){return ext==='py'?'py':(JSFAMILY.has(ext)?'js':ext);}
-  function ruleApplies(r,fam){
-    if(r.langs)return r.langs.includes(fam);     // explicit language list
+  function ruleApplies(r,fam,ext){
+    if(r.exts)return r.exts.includes(ext);        // explicit extension list (e.g. ts-only Angular rules)
+    if(r.langs)return r.langs.includes(fam);      // explicit language family list
     if(UNIVERSAL_RULES.has(r.id))return true;     // language-agnostic
     return fam==='js';                            // default: JS-family rules only
   }
   function scanLines(file){
     const out=[];const lines=file.content.split('\n');
     const fam=famOf(file.ext);const isPy=fam==='py';
+    const isTest=isTestFile(file.path);   // skip noisy fixture-only rules in test files
     let depthLoop=0,inTry=0,fnAwaitSeen=false,brace=0,pyLoopIndent=-1;
     for(let i=0;i<lines.length;i++){
       const raw=lines[i];const line=raw;
@@ -1126,7 +1244,8 @@ const PatternEngine = (()=>{
       const ctx={inLoop:depthLoop>0||opensLoop,inTry:inTry>0,afterAwaitInFn:fnAwaitSeen,
         catchOnly:false,catchBodyOnlyLog:false};
       for(const r of RULES){
-        if(!ruleApplies(r,fam))continue;
+        if(!ruleApplies(r,fam,file.ext))continue;
+        if(isTest&&r.skipInTests)continue;   // fixture creds / localhost / redirect tests are expected
         try{
           if(r.test(line,ctx)){
             out.push(makeFinding(r,file,i+1,raw.trim(),raw));
@@ -1314,22 +1433,34 @@ const DepScanner = (()=>{
   }
 
   async function run(files){
-    const pkg=files.find(f=>basename(f.path)==='package.json');
-    if(!pkg)return {findings:[],scanned:0,note:'no package.json'};
-    const deps=parseDeps(pkg);
+    // Scan every package.json (monorepos like Juice Shop have root + frontend manifests).
+    const pkgs=files.filter(f=>basename(f.path)==='package.json');
+    console.log('[DepScanner] package.json files found:',pkgs.map(p=>p.path));
+    if(!pkgs.length){console.warn('[DepScanner] no package.json in analyzed file set — skipping');return {findings:[],scanned:0,note:'no package.json'};}
+
+    // each dep keeps a back-reference to the manifest it came from
+    const deps=[];
+    for(const pkg of pkgs){
+      const parsed=parseDeps(pkg);
+      console.log(`[DepScanner] ${pkg.path}: parsed ${parsed.length} resolvable deps`);
+      parsed.forEach(d=>deps.push({...d,pkg}));
+    }
     if(!deps.length)return {findings:[],scanned:0,note:'no resolvable versions'};
 
+    console.log(`[DepScanner] querying OSV.dev for ${deps.length} deps → ${OSV_BATCH}`);
     let results;
     try{
       const resp=await fetch(OSV_BATCH,{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({queries:deps.map(d=>({package:{ecosystem:'npm',name:d.name},version:d.version}))})});
+      console.log('[DepScanner] OSV querybatch status:',resp.status);
       if(!resp.ok)throw new Error('OSV HTTP '+resp.status);
       results=(await resp.json()).results||[];
-    }catch(e){ return {findings:[],scanned:deps.length,error:e.message}; }
+    }catch(e){ console.error('[DepScanner] OSV.dev request failed:',e); return {findings:[],scanned:deps.length,error:e.message}; }
 
     // fetch details for unique advisory ids (capped) to get severity + fix versions
     const idSet=new Set();
     results.forEach(r=>((r&&r.vulns)||[]).forEach(v=>idSet.add(v.id)));
+    console.log(`[DepScanner] OSV returned advisories for ${results.filter(r=>r&&r.vulns&&r.vulns.length).length}/${deps.length} deps, ${idSet.size} unique advisories`);
     const detailIds=[...idSet].slice(0,60);
     const details={};
     await Promise.all(detailIds.map(async id=>{
@@ -1338,6 +1469,7 @@ const DepScanner = (()=>{
 
     const findings=[];
     deps.forEach((d,i)=>{
+      const pkg=d.pkg;
       const vulns=(results[i]&&results[i].vulns)||[];
       if(!vulns.length)return;
       const ids=vulns.map(v=>v.id);
@@ -1361,6 +1493,7 @@ const DepScanner = (()=>{
         advisories:ids,
       });
     });
+    console.log(`[DepScanner] done: ${findings.length} vulnerable dependencies across ${pkgs.length} manifest(s)`);
     return {findings,scanned:deps.length,vulnerable:findings.length};
   }
   return {run,parseDeps,cleanVersion};
@@ -2568,6 +2701,12 @@ const QuickWins = (()=>{
       'py-secret-key':'Prevents session/cookie forgery','sec-http-url':'Stops cleartext data interception',
       'sec-csrf-missing':'Blocks cross-site request forgery on state-changing routes',
       'sec-open-redirect':'Stops attacker-controlled redirects used for phishing',
+      'sec-xss-reflected':'Prevents reflected XSS / session hijacking','sec-xss-jquery':'Prevents DOM XSS via jQuery .html()',
+      'sec-xss-render':'Prevents XSS through unescaped template output',
+      'sec-ng-bypass':'Restores Angular\'s built-in XSS sanitization','sec-ng-innerhtml':'Reduces XSS risk from raw HTML binding',
+      'sec-jwt-no-alg':'Prevents JWT algorithm-confusion / forged tokens',
+      'sec-proto-pollution':'Prevents global prototype pollution from user input',
+      'dep-vuln':'Removes a known-exploitable dependency CVE',
       'auth-missing':'Closes unauthenticated access to this endpoint'}[f.ruleId];
     return specific||base||f.description.slice(0,80);
   }
@@ -3542,13 +3681,16 @@ function renderSidebar(){
   for(const f of sorted){
     const h=State.fileHealth[f.path]||{status:'gray',issues:0};
     const isDead=State.deadCode.some(d=>d.file===f.path);
+    const isTest=isTestFile(f.path);
     const worst=worstOf(f.path);
     const tip=`${f.path}\nhealth ${h.score} · ${h.issues} issue(s)`+
-      (worst?` · worst: ${OutputEngine.SEV_LABEL[worst]}`:'')+(isDead?' · has dead code':'');
+      (worst?` · worst: ${OutputEngine.SEV_LABEL[worst]}`:'')+(isDead?' · has dead code':'')+
+      (isTest?'\nTest file — security rules partially skipped':'');
     const item=el('div',{class:'tree-item',title:tip,onClick:()=>showFileFindings(f.path)},
-      el('span',{class:'dot '+h.status}),
+      el('span',{class:'dot '+(isTest?'gray':h.status)}),
       el('span',{class:'nm'},f.path.length>30?'…'+f.path.slice(-28):f.path),
-      worst?el('span',{class:'sev-pip b-'+worst},OutputEngine.SEV_LABEL[worst][0]):null,
+      isTest?el('span',{class:'tbadge',title:'Test file — security rules partially skipped'},'T')
+        :(worst?el('span',{class:'sev-pip b-'+worst},OutputEngine.SEV_LABEL[worst][0]):null),
       h.issues?el('span',{class:'cnt'},String(h.issues)):(isDead?el('span',{class:'cnt',style:'color:var(--gray)'},'dead'):null));
     tree.append(item);
   }
