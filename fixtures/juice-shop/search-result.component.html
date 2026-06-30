@@ -1,0 +1,10 @@
+<!-- Juice Shop-style Angular template — exercises sec-ng-innerhtml in a .html file. -->
+<div class="search-result">
+  <!-- Renders attacker-controlled search value as raw HTML (XSS sink): -->
+  <span [innerHTML]="searchValue"></span>
+
+  <!-- Safe: text interpolation is auto-escaped (should NOT flag) -->
+  <p>{{ productDescription }}</p>
+
+  <button (click)="addToBasket(product.id)">Add</button>
+</div>

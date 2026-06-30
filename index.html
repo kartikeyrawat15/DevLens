@@ -114,6 +114,10 @@ code,pre,.mono{font-family:var(--mono)}
 .tree-item .tbadge{font-size:9px;font-weight:700;width:14px;height:14px;border-radius:3px;
   display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
   background:var(--gray);color:var(--bg)}
+.cgroup{border-style:dashed}
+.cgroup .cg-count{font-size:11px;color:var(--fg3);font-family:var(--mono);margin-left:auto;margin-right:10px;white-space:nowrap}
+.cgroup .cg-items{padding:6px 6px 2px;border-top:1px solid var(--border)}
+.cgroup .cg-items .finding{margin:6px 0}
 .cv-line.flagged{background:rgba(218,170,63,.08)}
 
 /* ---------- Quick Wins ---------- */
@@ -682,11 +686,24 @@ const LANG_BY_EXT={
   kt:'Kotlin',scala:'Scala',vue:'Vue',svelte:'Svelte',
   json:'JSON',yml:'YAML',yaml:'YAML',html:'HTML',css:'CSS',sql:'SQL',sh:'Shell'
 };
-const ANALYZABLE=new Set(['js','mjs','cjs','jsx','ts','tsx','py','rb','php','java','go','vue','svelte']);
+const ANALYZABLE=new Set(['js','mjs','cjs','jsx','ts','tsx','py','rb','php','java','go','vue','svelte','html','htm']);
 const JSFAMILY=new Set(['js','mjs','cjs','jsx','ts','tsx','vue','svelte']);
+// HTML/template files are fetched & pattern-scanned (Angular [innerHTML] etc.) but are NOT
+// code — the symbol/dead-code, taint and auth engines must skip them.
+const TEMPLATE_EXTS=new Set(['html','htm']);
+const isTemplate=ext=>TEMPLATE_EXTS.has(ext);
 // Dependency manifests: small, always critical for dep scanning — never dropped by the file cap.
 const ALWAYS_INCLUDE=new Set(['package.json','requirements.txt','Pipfile','go.mod','Cargo.toml','pom.xml','build.gradle']);
 const isManifest=path=>ALWAYS_INCLUDE.has(basename(path));
+// Security-critical files that must be fetched/analyzed even on large repos: Angular
+// component code + templates (DomSanitizer bypass, [innerHTML]) and auth/crypto files.
+const isSecurityCritical=path=>{
+  const p=String(path||'');
+  return /\.component\.(ts|tsx|js|html|htm)$/i.test(p)
+    || /(auth|login|logout|jwt|token|security|sanitiz|crypto|password|passport|session|oauth)/i.test(basename(p));
+};
+// Files that should bypass the file cap entirely (manifests + security-critical).
+const isAlwaysAnalyze=path=>isManifest(path)||isSecurityCritical(path);
 // Test/spec files: fixture credentials, localhost URLs and redirect tests are expected,
 // so a subset of security rules is skipped for them (see PatternEngine `skipInTests`).
 const isTestFile=path=>{
@@ -1009,25 +1026,33 @@ const PatternEngine = (()=>{
      poc:'Feed a value containing `<img src=x onerror=…>` (or `javascript:` for URLs); Angular renders it without sanitizing.',
      learn:'https://angular.io/guide/security#bypass-security-apis'},
 
-    {id:'sec-ng-innerhtml',cat:'security',sev:7,cwe:'CWE-79',cvss:6.1,exts:['ts','tsx'],
+    {id:'sec-ng-innerhtml',cat:'security',sev:7,cwe:'CWE-79',cvss:6.1,exts:['ts','tsx','html','htm'],
      title:'Angular [innerHTML] binding (potential XSS)',
      test:l=>/\[innerHTML\]\s*=\s*["'][^"']*[A-Za-z_$][^"']*["']/.test(l)&&!isComment(l),
-     desc:'An [innerHTML] binding renders its expression as HTML. Angular sanitizes it, but combined with a DomSanitizer bypass or a permissive value it is a common XSS sink — prefer text interpolation.',
+     desc:'An [innerHTML] binding renders its expression as HTML. Angular sanitizes it, but combined with a DomSanitizer bypass or a permissive value it is a common XSS sink — prefer text interpolation. Applies to inline (.ts) and external (.html) component templates.',
      fix:l=>'// Prefer interpolation {{ value }}; if HTML is required, sanitize explicitly and never bypass.',
      learn:'https://angular.io/guide/security#sanitization-and-security-contexts'},
 
     /* ───────── JWT algorithm confusion (js/ts) ───────── */
     {id:'sec-jwt-no-alg',cat:'security',sev:7,cwe:'CWE-347',cvss:7.5,
      title:'jwt.verify() without an explicit algorithms allow-list',
-     test:l=>{
+     test:(l,c)=>{
        if(isComment(l))return false;
        // explicitly accepting the "none" algorithm is always wrong
        if(/algorithms?\s*:\s*\[?\s*['"]none['"]/i.test(l))return true;
-       if(!/jwt\s*\.\s*verify\s*\(/.test(l))return false;
-       if(/algorithms?\s*:/.test(l))return false;                 // allow-list present on this line
-       const after=(l.split(/jwt\s*\.\s*verify\s*\(/)[1]||'');
-       if(/\{/.test(after))return false;                          // options object opened (algs may be on later lines)
-       return true;                                               // verify(token, secret[, cb]) with no options at all
+       const m=/jwt\s*\.\s*verify\s*\(/.exec(l);
+       if(!m)return false;
+       // Assemble the full verify(...) argument list, which may span lines, by walking
+       // from the "(" until parens balance (using the lookahead window in ctx.ahead).
+       const text=l+(c&&c.ahead?'\n'+c.ahead:'');
+       let depth=0,started=false,call='';
+       for(let k=m.index;k<text.length;k++){
+         const ch=text[k];call+=ch;
+         if(ch==='('){depth++;started=true;}
+         else if(ch===')'){depth--;if(started&&depth===0)break;}
+       }
+       if(/algorithms?\s*:/.test(call))return false;   // explicit allow-list anywhere in the call
+       return true;                                    // verify(...) with no algorithms option
      },
      desc:'jwt.verify() without an `algorithms` allow-list lets an attacker choose the algorithm — including `none` (unsigned) or swapping RS256→HS256 to sign tokens with the public key. Always pin the expected algorithm(s).',
      fix:l=>l.replace(/jwt\s*\.\s*verify\s*\(([^)]*)\)/,'jwt.verify($1, { algorithms: ["HS256"] })'),
@@ -1242,7 +1267,8 @@ const PatternEngine = (()=>{
       if(/\btry\s*\{/.test(line)||(isPy&&/^\s*try\s*:/.test(line)))inTry++;
       if(/\bawait\b/.test(line))fnAwaitSeen=true;
       const ctx={inLoop:depthLoop>0||opensLoop,inTry:inTry>0,afterAwaitInFn:fnAwaitSeen,
-        catchOnly:false,catchBodyOnlyLog:false};
+        catchOnly:false,catchBodyOnlyLog:false,
+        ahead:lines.slice(i+1,i+4).join('\n')};  // small lookahead for multi-line calls (e.g. jwt.verify options)
       for(const r of RULES){
         if(!ruleApplies(r,fam,file.ext))continue;
         if(isTest&&r.skipInTests)continue;   // fixture creds / localhost / redirect tests are expected
@@ -1274,7 +1300,9 @@ const PatternEngine = (()=>{
 
   /* structural / metric checks */
   function scanStructural(file){
-    const out=[];const lines=file.content.split('\n');
+    const out=[];
+    if(isTemplate(file.ext))return out;   // templates aren't code — skip file/line-length metrics
+    const lines=file.content.split('\n');
     // File too long
     if(lines.length>300){
       out.push({id:uid('f'),source:'pattern',category:'quality',ruleId:'q-file-len',
@@ -1734,7 +1762,7 @@ const ASTEngine = (()=>{
     const perFile=Object.create(null);
 
     for(const f of files){
-      if(!ANALYZABLE.has(f.ext)){perFile[f.path]={symbols:[]};continue;}
+      if(!ANALYZABLE.has(f.ext)||isTemplate(f.ext)){perFile[f.path]={symbols:[]};continue;}
       const parsed=parseFile(f);
       perFile[f.path]=parsed;
       exportMap[f.path]=parsed.exportNames;
@@ -2015,7 +2043,7 @@ const DataFlowEngine = (()=>{
   function run(files){
     const flows=[];
     for(const f of files){
-      if(!ANALYZABLE.has(f.ext))continue;
+      if(!ANALYZABLE.has(f.ext)||isTemplate(f.ext))continue;
       const lines=f.content.split('\n');
       // map: tainted var name -> source line/name
       const tainted={};
@@ -2179,7 +2207,7 @@ const AuthMapper = (()=>{
   function run(files){
     const routes=[];
     for(const f of files){
-      if(!ANALYZABLE.has(f.ext))continue;
+      if(!ANALYZABLE.has(f.ext)||isTemplate(f.ext))continue;
       const lines=f.content.split('\n');
       for(let i=0;i<lines.length;i++){
         const line=lines[i];
@@ -3351,8 +3379,10 @@ const Input = (()=>{
   function prioritize(files){
     // top files by complexity priority: prefer analyzable, larger, route/auth-ish
     const score=f=>{let s=f.content.length/1000;
-      if(/(route|controller|auth|api|server|app|index|middleware|model|service)/i.test(f.path))s+=50;
+      if(/(route|controller|auth|api|server|app|index|middleware|model|service|component)/i.test(f.path))s+=50;
+      if(isSecurityCritical(f.path))s+=60;        // Angular components, auth/crypto files
       if(JSFAMILY.has(f.ext))s+=20;if(f.ext==='py')s+=15;
+      if(isTemplate(f.ext))s+=8;                  // Angular templates carry [innerHTML] sinks
       if(basename(f.path)==='package.json')s+=10;return s;};
     return files.sort((a,b)=>score(b)-score(a)).slice(0,MAX_FILES);
   }
@@ -3381,10 +3411,16 @@ const Input = (()=>{
     if(!tr.ok)throw new Error('Could not read repository tree ('+tr.status+').');
     const tree=(await tr.json()).tree||[];
     let blobs=tree.filter(t=>t.type==='blob'&&isSource(t.path)&&!SKIP_DIR.test(t.path)&&t.size<MAX_BYTES);
-    // priority by path heuristic then size, cap at 20 fetched
-    blobs.sort((a,b)=>{const s=p=>/(route|controller|auth|api|server|app|index|middleware|model|service)/i.test(p)?-1:0;
+    // priority by path heuristic then size
+    blobs.sort((a,b)=>{const s=p=>(isAlwaysAnalyze(p)?-2:0)+(/(route|controller|auth|api|server|app|index|middleware|model|service|component)/i.test(p)?-1:0);
       return s(a.path)-s(b.path)||(b.size-a.size);});
-    blobs=blobs.slice(0,Math.min(MAX_FILES,20));
+    // take the top slice, then guarantee security-critical files (Angular components,
+    // auth/crypto) and manifests are fetched even if they fell below the cut.
+    let pick=blobs.slice(0,Math.min(MAX_FILES,30));
+    const picked=new Set(pick.map(b=>b.path));
+    for(const b of blobs){if(pick.length>=MAX_FILES)break;
+      if(isAlwaysAnalyze(b.path)&&!picked.has(b.path)){pick.push(b);picked.add(b.path);}}
+    blobs=pick;
     if(!blobs.length)throw new Error('No analyzable source files found in this repo.');
 
     const files=[];
@@ -3468,9 +3504,10 @@ async function runAnalysis(allFiles){
   const LIMIT=30;let files=allFiles;let prioritized=false;
   if(allFiles.length>LIMIT){
     files=Input.prioritize([...allFiles]).slice(0,LIMIT);
-    // dependency manifests are tiny but critical — include them even if the cap dropped them
+    // dependency manifests + security-critical files (Angular components, auth/crypto) are
+    // tiny but critical — include them even if the cap dropped them
     const have=new Set(files.map(f=>f.path));
-    for(const f of allFiles){if(isManifest(f.path)&&!have.has(f.path)){files.push(f);have.add(f.path);}}
+    for(const f of allFiles){if(isAlwaysAnalyze(f.path)&&!have.has(f.path)){files.push(f);have.add(f.path);}}
     prioritized=true;
   }
   State.files=files;
@@ -3831,7 +3868,56 @@ function qwDiff(before,after){
   return wrap;
 }
 
-function renderSecurity(){OutputEngine.renderList($('#panel-security'),State.grouped.security,'No security issues detected. 🔒');}
+function renderSecurity(){
+  const panel=$('#panel-security');panel.innerHTML='';
+  const findings=State.grouped.security;
+  if(!findings.length){OutputEngine.renderList(panel,findings,'No security issues detected. 🔒');return;}
+  // Collapse noise: when MORE THAN 5 findings share the same ruleId in the same file
+  // (e.g. Juice Shop's 67 intentional "no auth middleware" routes), fold them into one
+  // expandable card so genuine findings stay visible at the top.
+  const THRESHOLD=5;
+  const groups={};
+  for(const f of findings){const k=f.ruleId+'::'+f.file;(groups[k]=groups[k]||[]).push(f);}
+  const collapsedKeys=new Set(Object.keys(groups).filter(k=>groups[k].length>THRESHOLD));
+  const emitted=new Set();
+  for(const f of findings){
+    const k=f.ruleId+'::'+f.file;
+    if(collapsedKeys.has(k)){
+      if(emitted.has(k))continue;          // collapse card already placed at the group's top-ranked finding
+      emitted.add(k);
+      panel.append(collapsedGroupCard(groups[k]));
+    }else{
+      panel.append(OutputEngine.card(f));
+    }
+  }
+}
+function collapsedGroupCard(items){
+  const n=items.length,file=items[0].file,ruleId=items[0].ruleId;
+  const order=['crit','high','med','low','info'];
+  const band=order.find(b=>items.some(x=>x.band===b))||'med';
+  const isAuth=ruleId==='auth-missing';
+  const title=isAuth?`Route auth coverage — ${basename(file)}`
+                    :`${basename(file)} — ${n} repeated findings`;
+  const summary=isAuth?`${n} routes missing auth middleware`
+                      :`${n} × ${items[0].title.replace(/\s*\(.*$/,'').slice(0,60)}`;
+  const c=el('div',{class:'finding sev-'+band+' cgroup'});
+  const expand=el('div',{class:'cg-items',style:'display:none'});
+  let built=false;
+  const btn=el('button',{class:'mini-btn',onClick:e=>{
+    e.stopPropagation();
+    if(!built){for(const f of items)expand.append(OutputEngine.card(f));built=true;}
+    const open=expand.style.display!=='none';
+    expand.style.display=open?'none':'block';
+    btn.textContent=open?`Show all (${n})`:'Hide';
+  }},`Show all (${n})`);
+  const head=el('div',{class:'finding-head'},
+    el('span',{class:'badge2 b-'+band},OutputEngine.SEV_LABEL[band]),
+    el('span',{class:'finding-title'},title),
+    el('span',{class:'cg-count'},summary),
+    btn);
+  c.append(head,expand);
+  return c;
+}
 function renderBugs(){OutputEngine.renderList($('#panel-bugs'),State.grouped.bugs,'No bugs detected. 🐛');}
 function renderQuality(){OutputEngine.renderList($('#panel-quality'),State.grouped.quality,'Clean code — no quality issues. ✨');}
 
