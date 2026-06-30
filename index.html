@@ -702,8 +702,12 @@ const isSecurityCritical=path=>{
   return /\.component\.(ts|tsx|js|html|htm)$/i.test(p)
     || /(auth|login|logout|jwt|token|security|sanitiz|crypto|password|passport|session|oauth)/i.test(basename(p));
 };
-// Files that should bypass the file cap entirely (manifests + security-critical).
-const isAlwaysAnalyze=path=>isManifest(path)||isSecurityCritical(path);
+// Entry points: route definitions, middleware setup, CSRF/auth config live here.
+// Missing them means missing the auth matrix entirely — match by basename like manifests.
+const ENTRY_POINTS=new Set(['server.ts','server.js','app.ts','app.js','index.ts','index.js','main.ts','main.js']);
+const isEntryPoint=path=>ENTRY_POINTS.has(basename(path));
+// Files that should bypass the file cap entirely (manifests + security-critical + entry points).
+const isAlwaysAnalyze=path=>isManifest(path)||isSecurityCritical(path)||isEntryPoint(path);
 // Test/spec files: fixture credentials, localhost URLs and redirect tests are expected,
 // so a subset of security rules is skipped for them (see PatternEngine `skipInTests`).
 const isTestFile=path=>{
@@ -3414,11 +3418,13 @@ const Input = (()=>{
     // priority by path heuristic then size
     blobs.sort((a,b)=>{const s=p=>(isAlwaysAnalyze(p)?-2:0)+(/(route|controller|auth|api|server|app|index|middleware|model|service|component)/i.test(p)?-1:0);
       return s(a.path)-s(b.path)||(b.size-a.size);});
-    // take the top slice, then guarantee security-critical files (Angular components,
-    // auth/crypto) and manifests are fetched even if they fell below the cut.
-    let pick=blobs.slice(0,Math.min(MAX_FILES,30));
+    // take the top slice, then guarantee always-include files (entry points like
+    // server.ts/app.ts, Angular components, auth/crypto, manifests) are fetched even
+    // if they fell below the cut. Bounded ceiling avoids runaway fetches on huge repos.
+    let pick=blobs.slice(0,MAX_FILES);
     const picked=new Set(pick.map(b=>b.path));
-    for(const b of blobs){if(pick.length>=MAX_FILES)break;
+    const FETCH_CEIL=MAX_FILES*2;
+    for(const b of blobs){if(pick.length>=FETCH_CEIL)break;
       if(isAlwaysAnalyze(b.path)&&!picked.has(b.path)){pick.push(b);picked.add(b.path);}}
     blobs=pick;
     if(!blobs.length)throw new Error('No analyzable source files found in this repo.');
@@ -3500,12 +3506,16 @@ async function runAnalysis(allFiles){
   $('#progress-overlay').classList.add('show');
   renderSteps();
 
-  // Phase 7: cap & prioritize at 30 files by complexity/relevance
-  const LIMIT=30;let files=allFiles;let prioritized=false;
-  if(allFiles.length>LIMIT){
+  // Phase 7: tiered cap by repo size — small repos analyze everything, large repos
+  // raise the cap so route/auth files aren't squeezed out by component noise.
+  //   <30 files → all   |   30–50 files → 40   |   >50 files → 50
+  const N=allFiles.length;
+  const LIMIT = N<30 ? N : (N<=50 ? 40 : 50);
+  let files=allFiles;let prioritized=false;
+  if(N>LIMIT){
     files=Input.prioritize([...allFiles]).slice(0,LIMIT);
-    // dependency manifests + security-critical files (Angular components, auth/crypto) are
-    // tiny but critical — include them even if the cap dropped them
+    // entry points (server.ts/app.ts), manifests, and security-critical files
+    // (Angular components, auth/crypto) bypass the cap — include them if dropped.
     const have=new Set(files.map(f=>f.path));
     for(const f of allFiles){if(isAlwaysAnalyze(f.path)&&!have.has(f.path)){files.push(f);have.add(f.path);}}
     prioritized=true;
@@ -3513,8 +3523,16 @@ async function runAnalysis(allFiles){
   State.files=files;
   $('#prog-title').textContent='Analyzing '+files.length+' files…';
   if(prioritized){
-    $('#prog-sub').textContent=`${allFiles.length} files found — analyzing top ${LIMIT} by complexity (routes/controllers/auth/large files first)`;
-    showBanner(`Large repo: analyzing the top ${LIMIT} of ${allFiles.length} files, prioritized by complexity & relevance (route/controller/auth/service/model files and larger files first).`);
+    // accurate breakdown so users see exactly why files were included
+    const nEntry=files.filter(f=>isEntryPoint(f.path)).length;
+    const nSec=files.filter(f=>isSecurityCritical(f.path)&&!isEntryPoint(f.path)).length;
+    const nComplexity=files.length-nEntry-nSec;
+    const parts=[`${nComplexity} by complexity`];
+    if(nSec)parts.push(`${nSec} security-critical`);
+    if(nEntry)parts.push(`${nEntry} entry point${nEntry>1?'s':''}`);
+    const breakdown=parts.join(' + ');
+    $('#prog-sub').textContent=`${allFiles.length} files found — analyzing ${files.length} (${breakdown})`;
+    showBanner(`Large repo: analyzing ${files.length} of ${allFiles.length} files (${breakdown}).`);
   }
 
   const analyzable=files.filter(f=>ANALYZABLE.has(f.ext));
