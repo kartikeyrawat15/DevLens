@@ -695,12 +695,21 @@ const isTemplate=ext=>TEMPLATE_EXTS.has(ext);
 // Dependency manifests: small, always critical for dep scanning — never dropped by the file cap.
 const ALWAYS_INCLUDE=new Set(['package.json','requirements.txt','Pipfile','go.mod','Cargo.toml','pom.xml','build.gradle']);
 const isManifest=path=>ALWAYS_INCLUDE.has(basename(path));
-// Security-critical files that must be fetched/analyzed even on large repos: Angular
-// component code + templates (DomSanitizer bypass, [innerHTML]) and auth/crypto files.
+// Security-critical files that must be fetched/analyzed even on large repos. Kept tight
+// on purpose: matching every *.component.ts / *.service.ts floods the set (98/100 on
+// Juice Shop), so we target specific auth/crypto/data-access files and path segments.
+// Entry points (server/app/index) are NOT matched here — isEntryPoint owns those.
 const isSecurityCritical=path=>{
   const p=String(path||'');
-  return /\.component\.(ts|tsx|js|html|htm)$/i.test(p)
-    || /(auth|login|logout|jwt|token|security|sanitiz|crypto|password|passport|session|oauth)/i.test(basename(p));
+  const b=basename(p);
+  // 3. security-related path segments — NOT /components/ or /services/ (too broad in Angular)
+  if(/\/(auth|security|crypto|middleware)\//i.test(p))return true;
+  // 1. auth/security files by name, with an optional .service/.component/.guard qualifier
+  if(/^(auth|login|logout|session|jwt|token|crypto|password|passwd|secret|secrets|middleware|passport|oauth)(\.(service|component|guard|interceptor|strategy|middleware|controller))?\.[mc]?[jt]sx?$/i.test(b))return true;
+  // 4. data access: DAOs, repositories, db/database
+  if(/(-dao|\.repository)\.[mc]?[jt]sx?$/i.test(b))return true;
+  if(/^(db|database)\.[mc]?[jt]sx?$/i.test(b))return true;
+  return false;
 };
 // Entry points: route definitions, middleware setup, CSRF/auth config live here.
 // Missing them means missing the auth matrix entirely — match by basename like manifests.
@@ -3520,23 +3529,39 @@ async function runAnalysis(allFiles){
   const LIMIT = N<30 ? N : (N<=50 ? 40 : 50);
   let files=allFiles;let prioritized=false;
   if(N>LIMIT){
-    files=Input.prioritize([...allFiles]).slice(0,LIMIT);
-    // entry points (server.ts/app.ts), manifests, and security-critical files
-    // (Angular components, auth/crypto) bypass the cap — include them if dropped.
-    const have=new Set(files.map(f=>f.path));
-    for(const f of allFiles){if(isAlwaysAnalyze(f.path)&&!have.has(f.path)){files.push(f);have.add(f.path);}}
     prioritized=true;
+    // Build the set so complexity ALWAYS contributes a floor, then layer the
+    // security/entry/manifest files on top (rather than letting them fill the whole cap):
+    //   1. complexity floor → 2. security-critical → 3. entry points → 4. manifests → 5. cap
+    const byComplexity=Input.prioritize([...allFiles]);
+    const have=new Set();const pick=[];
+    const add=f=>{if(!have.has(f.path)){have.add(f.path);pick.push(f);}};
+    byComplexity.slice(0,Math.min(15,LIMIT)).forEach(add);              // 1. complexity floor
+    for(const f of allFiles)if(isSecurityCritical(f.path))add(f);       // 2. security-critical
+    for(const f of allFiles)if(isEntryPoint(f.path))add(f);             // 3. entry points
+    for(const f of allFiles)if(isManifest(f.path))add(f);              // 4. manifests
+    // 5. cap at the tiered limit, but never drop entry points / manifests (server.ts etc.)
+    if(pick.length>LIMIT){
+      const must=new Set(pick.filter(f=>isEntryPoint(f.path)||isManifest(f.path)).map(f=>f.path));
+      const rest=pick.filter(f=>!must.has(f.path)).slice(0,Math.max(0,LIMIT-must.size));
+      files=[...rest,...pick.filter(f=>must.has(f.path))];
+    }else files=pick;
   }
   State.files=files;
   $('#prog-title').textContent='Analyzing '+files.length+' files…';
   if(prioritized){
-    // accurate breakdown so users see exactly why files were included
-    const nEntry=files.filter(f=>isEntryPoint(f.path)).length;
-    const nSec=files.filter(f=>isSecurityCritical(f.path)&&!isEntryPoint(f.path)).length;
-    const nComplexity=files.length-nEntry-nSec;
-    const parts=[`${nComplexity} by complexity`];
+    // accurate breakdown so users see exactly why files were included (each file counted once)
+    let nEntry=0,nSec=0,nManifest=0;
+    for(const f of files){
+      if(isEntryPoint(f.path))nEntry++;
+      else if(isManifest(f.path))nManifest++;
+      else if(isSecurityCritical(f.path))nSec++;
+    }
+    const nComplexity=files.length-nEntry-nSec-nManifest;
+    const parts=[`${nComplexity} complexity`];
     if(nSec)parts.push(`${nSec} security-critical`);
     if(nEntry)parts.push(`${nEntry} entry point${nEntry>1?'s':''}`);
+    if(nManifest)parts.push(`${nManifest} manifest${nManifest>1?'s':''}`);
     const breakdown=parts.join(' + ');
     $('#prog-sub').textContent=`${allFiles.length} files found — analyzing ${files.length} (${breakdown})`;
     showBanner(`Large repo: analyzing ${files.length} of ${allFiles.length} files (${breakdown}).`);
