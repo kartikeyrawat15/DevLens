@@ -1366,10 +1366,10 @@ const PatternEngine = (()=>{
   }
   const STATE_ROUTE=/\b(?:app|router)\s*\.\s*(post|put|delete|patch)\s*\(/i;
   const SESSION_MW=/app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{|express-session|cookie-session/;
-  // Active (not commented) CSRF protection: middleware applied or token plumbing present.
-  // helmet()/lusca()/csurf()/csrfProtection all count as "some CSRF/security middleware
-  // present" — enough to suppress the missing-CSRF finding.
-  const CSRF_ACTIVE=/app\.use\s*\(\s*(?:csrf|csurf)\b|app\.use\s*\(\s*lusca\.csrf|lusca\s*\(\s*\{[^}]*csrf|\blusca\s*\(|\bhelmet\s*(?:\.\w+)?\s*\(|\bcsrfProtection\b|req\.csrfToken\s*\(|\bcsrfToken\b|name\s*=\s*['"]_csrf['"]|\b_csrf\b|authenticity_token|\bxsrf\b|XSRF-TOKEN/i;
+  // Active (not commented) CSRF protection: real CSRF middleware or token plumbing only.
+  // helmet() is security *headers* (CSP/HSTS), NOT CSRF protection, and bare lusca()
+  // without .csrf() isn't either — so neither suppresses the missing-CSRF finding.
+  const CSRF_ACTIVE=/app\.use\s*\(\s*(?:csrf|csurf)\b|app\.use\s*\(\s*lusca\.csrf|lusca\s*\(\s*\{[^}]*csrf|\bcsrfProtection\b|req\.csrfToken\s*\(|\bcsrfToken\b|name\s*=\s*['"]_csrf['"]|\b_csrf\b|authenticity_token|\bxsrf\b|XSRF-TOKEN/i;
 
   // Project-wide CSRF signals across the whole file set (routes & session middleware
   // often live in different files — e.g. NodeGoat's server.js vs app/routes/*).
