@@ -713,7 +713,9 @@ const isSecurityCritical=path=>{
 };
 // Entry points: route definitions, middleware setup, CSRF/auth config live here.
 // Missing them means missing the auth matrix entirely — match by basename like manifests.
-const ENTRY_POINTS=new Set(['server.ts','server.js','app.ts','app.js','main.ts','main.js']);
+const ENTRY_POINTS=new Set(['server.ts','server.js','app.ts','app.js','main.ts','main.js',
+  // Python web entry points: Flask/Django route + middleware + config live here
+  'app.py','main.py','wsgi.py','asgi.py','manage.py','run.py','application.py']);
 const BARREL_ENTRY=new Set(['index.ts','index.js']); // common as nested barrel files
 const isEntryPoint=path=>{
   const b=basename(path);
@@ -1207,7 +1209,8 @@ const PatternEngine = (()=>{
      title:'XXE — XML parsed from user input without disabling external entities',
      test:l=>{
        if(isComment(l))return false;
-       const pySink=/\b(?:lxml\.etree\.parse|lxml\.etree\.fromstring|etree\.parse|etree\.fromstring|ElementTree\.parse|ElementTree\.fromstring|minidom\.parseString|minidom\.parse)\s*\(/;
+       // covers the common `import xml.etree.ElementTree as ET` alias and lxml.objectify too
+       const pySink=/\b(?:lxml\.etree\.parse|lxml\.etree\.fromstring|etree\.parse|etree\.fromstring|ElementTree\.parse|ElementTree\.fromstring|ET\.parse|ET\.fromstring|ET\.XML|objectify\.parse|objectify\.fromstring|minidom\.parseString|minidom\.parse|sax\.parse)\s*\(/;
        if(pySink.test(l))
          return callHasVar(l,pySink)&&!/resolve_entities\s*=\s*False|no_network\s*=\s*True|defusedxml/i.test(l);
        // JS/TS: DOMParser().parseFromString(xml,'text/xml') or libxmljs.parseXml(xml)
@@ -2143,7 +2146,7 @@ const DataFlowEngine = (()=>{
     {re:/\b(?:subprocess\.(?:call|run|Popen|check_output|check_call)|os\.system|os\.popen|commands\.getoutput)\s*\(/,name:'subprocess/os.system',sev:9,cwe:'CWE-78',kind:'command'},
     {re:/\bopen\s*\(/,name:'open()',sev:7,cwe:'CWE-22',kind:'path'},
     {re:/\b(?:requests\.(?:get|post|put|delete|head|patch|request)|urllib\.request\.urlopen|urllib2?\.urlopen|httpx\.(?:get|post|request))\s*\(/,name:'requests/urlopen',sev:9,cwe:'CWE-918',kind:'SSRF'},
-    {re:/\b(?:lxml\.etree\.parse|lxml\.etree\.fromstring|etree\.parse|etree\.fromstring|ElementTree\.parse|ElementTree\.fromstring|minidom\.parseString|minidom\.parse)\s*\(/,name:'XML parse',sev:9,cwe:'CWE-611',kind:'XXE'},
+    {re:/\b(?:lxml\.etree\.parse|lxml\.etree\.fromstring|etree\.parse|etree\.fromstring|ElementTree\.parse|ElementTree\.fromstring|ET\.parse|ET\.fromstring|ET\.XML|objectify\.parse|objectify\.fromstring|minidom\.parseString|minidom\.parse|sax\.parse)\s*\(/,name:'XML parse',sev:9,cwe:'CWE-611',kind:'XXE'},
     {re:/\b(?:pickle|cPickle|dill)\.loads?\s*\(/,name:'pickle.loads',sev:9,cwe:'CWE-502',kind:'deserialization'},
   ];
   const SANITIZERS=/escape|sanitize|encodeURI|validator|joi|zod|yup|parseInt|parseFloat|Number\(|toString\(|escapeHtml|DOMPurify|whitelist|allowlist|\.test\(|typeof\s|Array\.isArray|bcrypt|hash/i;
