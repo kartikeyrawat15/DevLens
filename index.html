@@ -704,8 +704,15 @@ const isSecurityCritical=path=>{
 };
 // Entry points: route definitions, middleware setup, CSRF/auth config live here.
 // Missing them means missing the auth matrix entirely — match by basename like manifests.
-const ENTRY_POINTS=new Set(['server.ts','server.js','app.ts','app.js','index.ts','index.js','main.ts','main.js']);
-const isEntryPoint=path=>ENTRY_POINTS.has(basename(path));
+const ENTRY_POINTS=new Set(['server.ts','server.js','app.ts','app.js','main.ts','main.js']);
+const BARREL_ENTRY=new Set(['index.ts','index.js']); // common as nested barrel files
+const isEntryPoint=path=>{
+  const b=basename(path);
+  if(ENTRY_POINTS.has(b))return true;            // server/app/main: usually one per repo, match anywhere
+  // index.ts/js: only count root or one level deep (index.ts, src/index.ts) — not nested
+  // barrels like src/components/Button/index.ts which would flood the always-include set.
+  return BARREL_ENTRY.has(b)&&String(path).split('/').length<=2;
+};
 // Files that should bypass the file cap entirely (manifests + security-critical + entry points).
 const isAlwaysAnalyze=path=>isManifest(path)||isSecurityCritical(path)||isEntryPoint(path);
 // Test/spec files: fixture credentials, localhost URLs and redirect tests are expected,
