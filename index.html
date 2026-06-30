@@ -734,6 +734,17 @@ const isTestFile=path=>{
     || /\.(test|spec)\.[mc]?[jt]sx?$/i.test(p)                                  // *.test.ts/js, *.spec.ts/js
     || /\.(unit|e2e|integration|int|component)\.test\.[mc]?[jt]sx?$/i.test(p);  // *.unit.test.*, *.e2e.test.*
 };
+// Vendor / minified / bundled third-party files: shown in the sidebar (gray "V" badge)
+// but never run through the security/dead-code/complexity engines — they are not the
+// user's code, so findings on them are noise and would skew the health score.
+const isVendorFile=path=>{
+  const p=String(path||'');const b=basename(p);
+  if(/\.min\.(js|css)$/i.test(b))return true;                                          // *.min.js / *.min.css
+  if(/(^|\/)(vendors?|bower_components|node_modules|dist|build)(\/)/i.test(p))return true; // bundled/3rd-party dirs
+  if(/(^|\/)(public|static)\/js\//i.test(p))return true;                               // /public/js/, /static/js/
+  if(/\.js$/i.test(b)&&/^(jquery|bootstrap|lodash|moment|angular|underscore|backbone|popper|select2|slick)[.\-]/i.test(b))return true; // known libs by name
+  return false;
+};
 
 /* ───────────────────────── Global application state ───────────────────────── */
 const State = {
@@ -1502,6 +1513,7 @@ const PatternEngine = (()=>{
     const proj=(ctx&&ctx.csrf)?ctx.csrf:csrfSignals(files);
     for(const f of files){
       if(!ANALYZABLE.has(f.ext))continue;
+      if(isVendorFile(f.path))continue;   // vendor/minified bundles: not the user's code — skip
       findings=findings.concat(scanLines(f),scanStructural(f),scanCsrf(f,proj));
     }
     return findings;
@@ -2726,6 +2738,7 @@ const Correlator = (()=>{
     for(const f of files){
       const fs=findings.filter(x=>x.file===f.path);
       const counts={crit:0,high:0,med:0,low:0,info:0};
+      if(isVendorFile(f.path)){health[f.path]={score:100,status:'gray',counts,issues:0,vendor:true};continue;}
       let penalty=0;
       for(const x of fs){counts[x.band]++;penalty+=x.severity*(x.confidence/100);}
       const isDead=State.deadCode.some(d=>d.file===f.path);
@@ -2744,7 +2757,7 @@ const Correlator = (()=>{
     const bugs=findings.filter(f=>f.category==='bugs');
     const qual=findings.filter(f=>f.category==='quality');
     const sevSum=arr=>arr.reduce((a,f)=>a+f.severity*(f.confidence/100),0);
-    const analyzable=files.filter(f=>ANALYZABLE.has(f.ext)).length||1;
+    const analyzable=files.filter(f=>ANALYZABLE.has(f.ext)&&!isVendorFile(f.path)).length||1;
     const security=clamp(100-sevSum(sec)*3/analyzable*2,0,100);
     const reliability=clamp(100-sevSum(bugs)*3/analyzable*2,0,100);
     const maintainability=clamp(100-sevSum(qual)*1.5/analyzable*2,0,100);
@@ -3659,7 +3672,10 @@ async function runAnalysis(allFiles){
     showBanner(`Large repo: analyzing ${files.length} of ${allFiles.length} files (${breakdown}).`);
   }
 
-  const analyzable=files.filter(f=>ANALYZABLE.has(f.ext));
+  // vendor/minified files stay in State.files (sidebar) but are excluded from every
+  // analysis engine: symbols, dead code, complexity, taint, auth, patterns.
+  const codeFiles=files.filter(f=>!isVendorFile(f.path));
+  const analyzable=codeFiles.filter(f=>ANALYZABLE.has(f.ext));
   const setFileProg=(done,total,label)=>{
     const base=STEPS.filter(s=>$('#step-'+s.k)?.classList.contains('done')).length;
     $('#pbar-fill').style.width=((base+done/Math.max(total,1))/STEPS.length*100)+'%';
@@ -3685,7 +3701,7 @@ async function runAnalysis(allFiles){
 
   // STEP 2 — AST (cross-file; single pass but yields internally)
   setStep('symbols','active');await tick();
-  const ast=await ASTEngine.run(files);
+  const ast=await ASTEngine.run(codeFiles);
   State.symbols=ast.symbols;State.callGraph=ast.callGraph;State.reverseCall=ast.reverseCall;
   State.importGraph=ast.importGraph;State.importedBy=ast.importedBy;State.exportMap=ast.exportMap;
   State.deadCode=ast.deadCode;State.deadExcluded=ast.deadExcluded;State.cycles=ast.cycles;State.symByName=ast.symByName;
@@ -3736,7 +3752,7 @@ async function runAnalysis(allFiles){
   if(State.aiAvailable){
     setStep('ai','active','Tier '+AIOrchestrator.getTierConfig().tier+' · starting');
     try{
-      const aiFindings=await runAIAnalysis(files);
+      const aiFindings=await runAIAnalysis(codeFiles);
       staticFindings=staticFindings.concat(aiFindings);
       State.aiUsed=true;
       setStep('ai','done',aiFindings.length+' AI findings');
@@ -3766,7 +3782,7 @@ async function runAnalysis(allFiles){
   renderAll();
 
   // fire AI narrative after main render (non-blocking)
-  if(State.aiAvailable)generateNarrative(files).catch(e=>console.warn(e));
+  if(State.aiAvailable)generateNarrative(codeFiles).catch(e=>console.warn(e));
 }
 
 async function runAIAnalysis(files){
@@ -3859,18 +3875,21 @@ function renderSidebar(){
   };
   for(const f of sorted){
     const h=State.fileHealth[f.path]||{status:'gray',issues:0};
-    const isDead=State.deadCode.some(d=>d.file===f.path);
-    const isTest=isTestFile(f.path);
-    const worst=worstOf(f.path);
-    const tip=`${f.path}\nhealth ${h.score} · ${h.issues} issue(s)`+
-      (worst?` · worst: ${OutputEngine.SEV_LABEL[worst]}`:'')+(isDead?' · has dead code':'')+
-      (isTest?'\nTest file — security rules partially skipped':'');
+    const isVendor=isVendorFile(f.path);
+    const isDead=!isVendor&&State.deadCode.some(d=>d.file===f.path);
+    const isTest=!isVendor&&isTestFile(f.path);
+    const worst=isVendor?null:worstOf(f.path);
+    const tip=isVendor?`${f.path}\nVendor/minified file — skipped`
+      :`${f.path}\nhealth ${h.score} · ${h.issues} issue(s)`+
+        (worst?` · worst: ${OutputEngine.SEV_LABEL[worst]}`:'')+(isDead?' · has dead code':'')+
+        (isTest?'\nTest file — security rules partially skipped':'');
     const item=el('div',{class:'tree-item',title:tip,onClick:()=>showFileFindings(f.path)},
-      el('span',{class:'dot '+(isTest?'gray':h.status)}),
+      el('span',{class:'dot '+(isVendor||isTest?'gray':h.status)}),
       el('span',{class:'nm'},f.path.length>30?'…'+f.path.slice(-28):f.path),
-      isTest?el('span',{class:'tbadge',title:'Test file — security rules partially skipped'},'T')
+      isVendor?el('span',{class:'tbadge',title:'Vendor/minified file — skipped'},'V')
+        :isTest?el('span',{class:'tbadge',title:'Test file — security rules partially skipped'},'T')
         :(worst?el('span',{class:'sev-pip b-'+worst},OutputEngine.SEV_LABEL[worst][0]):null),
-      h.issues?el('span',{class:'cnt'},String(h.issues)):(isDead?el('span',{class:'cnt',style:'color:var(--gray)'},'dead'):null));
+      isVendor?null:(h.issues?el('span',{class:'cnt'},String(h.issues)):(isDead?el('span',{class:'cnt',style:'color:var(--gray)'},'dead'):null)));
     tree.append(item);
   }
   // language breakdown
