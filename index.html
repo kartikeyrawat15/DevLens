@@ -871,7 +871,7 @@ const PatternEngine = (()=>{
 
     {id:'sec-sql-concat',cat:'security',sev:9,cwe:'CWE-89',cvss:9.8,
      title:'SQL injection via string concatenation',
-     test:l=>{
+     test:(l,ctx)=>{
        const isQuery=/(query|execute|raw|prepare)\s*\(/i.test(l);
        const hasSqlKw=/\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\b/i.test(l);
        if(!isQuery&&!hasSqlKw)return false;
@@ -881,7 +881,12 @@ const PatternEngine = (()=>{
        // string concatenation of a variable into a query string
        const concat=/["'][^"']*\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)\b[^"']*["']\s*\+\s*[A-Za-z_$]/i.test(l)
                    ||/["']\s*\+\s*[A-Za-z_$][\w.$]*/.test(l)&&hasSqlKw;
-       return tmplInterp||concat;
+       // Only dynamically-built SQL (interpolation/concatenation) is a real risk. A pure
+       // string literal — e.g. "SELECT * FROM users WHERE id = 1" — is never flagged; in
+       // test files these are fixtures/assertions, so the literal-skip matters most there.
+       const dynamic=tmplInterp||concat;
+       if(ctx&&ctx.isTest)return dynamic;   // tests: keep interpolated/concatenated, skip pure literals
+       return dynamic;
      },
      desc:'A variable is concatenated/interpolated directly into a SQL string. If any part is user-controlled this is SQL injection — and even a "trusted" variable here is fragile.',
      fix:l=>'// Use parameterized queries:\n// db.query("SELECT * FROM users WHERE id = ?", [userId]);',
@@ -1287,7 +1292,7 @@ const PatternEngine = (()=>{
       if(/\btry\s*\{/.test(line)||(isPy&&/^\s*try\s*:/.test(line)))inTry++;
       if(/\bawait\b/.test(line))fnAwaitSeen=true;
       const ctx={inLoop:depthLoop>0||opensLoop,inTry:inTry>0,afterAwaitInFn:fnAwaitSeen,
-        catchOnly:false,catchBodyOnlyLog:false,
+        catchOnly:false,catchBodyOnlyLog:false,isTest,
         ahead:lines.slice(i+1,i+4).join('\n')};  // small lookahead for multi-line calls (e.g. jwt.verify options)
       for(const r of RULES){
         if(!ruleApplies(r,fam,file.ext))continue;
@@ -1362,7 +1367,9 @@ const PatternEngine = (()=>{
   const STATE_ROUTE=/\b(?:app|router)\s*\.\s*(post|put|delete|patch)\s*\(/i;
   const SESSION_MW=/app\.use\s*\(\s*session\s*\(|\bsession\s*\(\s*\{|express-session|cookie-session/;
   // Active (not commented) CSRF protection: middleware applied or token plumbing present.
-  const CSRF_ACTIVE=/app\.use\s*\(\s*(?:csrf|csurf)\b|app\.use\s*\(\s*lusca\.csrf|lusca\s*\(\s*\{[^}]*csrf|\bcsrfProtection\b|req\.csrfToken\s*\(|\bcsrfToken\b|name\s*=\s*['"]_csrf['"]|\b_csrf\b|authenticity_token|\bxsrf\b|XSRF-TOKEN/i;
+  // helmet()/lusca()/csurf()/csrfProtection all count as "some CSRF/security middleware
+  // present" — enough to suppress the missing-CSRF finding.
+  const CSRF_ACTIVE=/app\.use\s*\(\s*(?:csrf|csurf)\b|app\.use\s*\(\s*lusca\.csrf|lusca\s*\(\s*\{[^}]*csrf|\blusca\s*\(|\bhelmet\s*(?:\.\w+)?\s*\(|\bcsrfProtection\b|req\.csrfToken\s*\(|\bcsrfToken\b|name\s*=\s*['"]_csrf['"]|\b_csrf\b|authenticity_token|\bxsrf\b|XSRF-TOKEN/i;
 
   // Project-wide CSRF signals across the whole file set (routes & session middleware
   // often live in different files — e.g. NodeGoat's server.js vs app/routes/*).
