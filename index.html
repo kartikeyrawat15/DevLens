@@ -3530,22 +3530,21 @@ async function runAnalysis(allFiles){
   let files=allFiles;let prioritized=false;
   if(N>LIMIT){
     prioritized=true;
-    // Build the set so complexity ALWAYS contributes a floor, then layer the
-    // security/entry/manifest files on top (rather than letting them fill the whole cap):
-    //   1. complexity floor → 2. security-critical → 3. entry points → 4. manifests → 5. cap
+    // The cap applies to complexity + security-critical files only; always-include
+    // files (entry points + manifests) are appended ON TOP of the cap so server.ts
+    // etc. are never squeezed out. Complexity fills the cap so it's actually used.
+    //   1. complexity floor → 2. security-critical → 3. fill to cap with complexity
+    //   → 4. trim to LIMIT → 5. append entry points + manifests on top
     const byComplexity=Input.prioritize([...allFiles]);
-    const have=new Set();const pick=[];
-    const add=f=>{if(!have.has(f.path)){have.add(f.path);pick.push(f);}};
-    byComplexity.slice(0,Math.min(15,LIMIT)).forEach(add);              // 1. complexity floor
-    for(const f of allFiles)if(isSecurityCritical(f.path))add(f);       // 2. security-critical
-    for(const f of allFiles)if(isEntryPoint(f.path))add(f);             // 3. entry points
-    for(const f of allFiles)if(isManifest(f.path))add(f);              // 4. manifests
-    // 5. cap at the tiered limit, but never drop entry points / manifests (server.ts etc.)
-    if(pick.length>LIMIT){
-      const must=new Set(pick.filter(f=>isEntryPoint(f.path)||isManifest(f.path)).map(f=>f.path));
-      const rest=pick.filter(f=>!must.has(f.path)).slice(0,Math.max(0,LIMIT-must.size));
-      files=[...rest,...pick.filter(f=>must.has(f.path))];
-    }else files=pick;
+    const have=new Set();const pool=[];
+    const add=f=>{if(!have.has(f.path)){have.add(f.path);pool.push(f);}};
+    byComplexity.slice(0,Math.min(15,LIMIT)).forEach(add);             // 1. complexity floor (guaranteed)
+    for(const f of allFiles)if(isSecurityCritical(f.path))add(f);      // 2. security-critical
+    for(const f of byComplexity){if(pool.length>=LIMIT)break;add(f);}  // 3. fill remaining capacity
+    files=pool.slice(0,LIMIT);                                         // 4. cap complexity+security at LIMIT
+    // 5. always-include files appended on top of the cap
+    const have2=new Set(files.map(f=>f.path));
+    for(const f of allFiles)if((isEntryPoint(f.path)||isManifest(f.path))&&!have2.has(f.path)){files.push(f);have2.add(f.path);}
   }
   State.files=files;
   $('#prog-title').textContent='Analyzing '+files.length+' files…';
